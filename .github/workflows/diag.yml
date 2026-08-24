@@ -1,0 +1,27 @@
+name: Diag Permission Groups
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query permission groups
+        env:
+          CF_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CF_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+        run: |
+          curl -s "https://api.cloudflare.com/client/v4/accounts/b89993964479e3e4d8f526745b926e7e/permission_groups" \
+            -H "X-Auth-Email: $CF_EMAIL" \
+            -H "X-Auth-Key: $CF_KEY" \
+            | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+if not d.get('success'):
+    print('ERROR:', json.dumps(d, ensure_ascii=False)[:400])
+    sys.exit(1)
+for g in sorted(d['result'], key=lambda x: x.get('name','')):
+    n = g.get('name','')
+    if ('Durable' in n) or ('Workers Script' in n) or ('Workers KV' in n):
+        print(g.get('id'), '|', n)
+"
