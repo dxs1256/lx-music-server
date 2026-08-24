@@ -74,5 +74,4 @@ jobs:
             -e 's/env\.KV[^ ]* \([^)]*\)/env.KV (***)/g' \
             -e 's#https://([a-z0-9-]+)\.[a-z0-9-]+\.workers\.dev/?#https://\1.***.workers.dev/#gI'
         env:
-          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
-          CLOUDFLARE_EMAIL: ${{ secrets.CLOUDFLARE_EMAIL }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
