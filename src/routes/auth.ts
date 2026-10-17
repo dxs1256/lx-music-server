@@ -1,6 +1,8 @@
 import { Hono } from 'hono'
 import { SYNC_CODE } from '@/constants'
-import { aesDecrypt, toMD5 } from '@/utils/crypto'
+import { aesDecrypt } from '@/utils/crypto'
+import { getKeySeed } from '@/utils/password'
+import { isRateLimited } from '@/utils/rateLimit'
 
 const app = new Hono<{ Bindings: LX.Env }>()
 
@@ -12,32 +14,6 @@ const getIP = (c: { req: { raw: Request } }) => {
   )
 }
 
-// In-memory rate limiting per IP (resets on Worker restart, sufficient as first-pass guard)
-const ipFailures = new Map<string, { count: number; resetAt: number }>()
-const RATE_LIMIT = 10
-const RATE_WINDOW_MS = 60 * 1000
-
-const checkRateLimit = (ip: string): boolean => {
-  const now = Date.now()
-  const entry = ipFailures.get(ip)
-  if (!entry || entry.resetAt < now) return false
-  return entry.count >= RATE_LIMIT
-}
-
-const recordFailure = (ip: string) => {
-  const now = Date.now()
-  const entry = ipFailures.get(ip)
-  if (!entry || entry.resetAt < now) {
-    ipFailures.set(ip, { count: 1, resetAt: now + RATE_WINDOW_MS })
-  } else {
-    entry.count++
-  }
-}
-
-const clearFailures = (ip: string) => {
-  ipFailures.delete(ip)
-}
-
 const parseUsers = (raw: string): LX.User[] | null => {
   try {
     return JSON.parse(raw || '[]')
@@ -47,15 +23,18 @@ const parseUsers = (raw: string): LX.User[] | null => {
   }
 }
 
+// `client:{id}` → userName 映射的 TTL（秒）。365 天，设备重新认证时续期，
+// 避免被删除外的所有路径留下永不过期的孤儿映射（REVIEW M5）。
+const CLIENT_MAPPING_TTL_SECONDS = 365 * 24 * 60 * 60
+
 app.get('/ah', async (c) => {
   const ip = getIP(c)
-  if (checkRateLimit(ip)) return c.text(SYNC_CODE.msgBlockedIp, 403)
+  if (await isRateLimited(c.env, ip)) return c.text(SYNC_CODE.msgBlockedIp, 403)
 
   const encryptedMsg = c.req.header('m')
   const clientId = c.req.header('i')
 
   if (!encryptedMsg) {
-    recordFailure(ip)
     return c.text(SYNC_CODE.msgAuthFailed, 401)
   }
 
@@ -68,7 +47,9 @@ app.get('/ah', async (c) => {
   if (clientId) {
     const userName = await kv.get(`client:${clientId}`)
     if (!userName) {
-      recordFailure(ip)
+      // 映射已过期（365 天 TTL）或被删除：客户端始终带 i 头、且不会自动回退到
+      // 首次认证，这里只能返回 401。用户需在客户端重新输入密码走首次认证重新
+      // 配对（会生成新的 clientId）。这是个人同步服务下可接受的权衡（REVIEW M5）。
       return c.text(SYNC_CODE.msgAuthFailed, 401)
     }
 
@@ -81,16 +62,19 @@ app.get('/ah', async (c) => {
       body: JSON.stringify({ encryptedMsg, clientId, serverName }),
     })
     if (!resp.ok) {
-      recordFailure(ip)
       return c.text(SYNC_CODE.msgAuthFailed, 401)
     }
-    clearFailures(ip)
+    // 重新认证成功即续期映射，避免活跃设备因 TTL 到期而被判为未知。
+    await kv.put(`client:${clientId}`, userName, {
+      expirationTtl: CLIENT_MAPPING_TTL_SECONDS,
+    })
     return c.text(await resp.text())
   }
 
   for (const userInfo of users) {
-    const keyHex = toMD5(userInfo.password).substring(0, 16)
-    const key = btoa(keyHex)
+    const keySeed = getKeySeed(userInfo)
+    if (!keySeed) continue
+    const key = btoa(keySeed)
     let text: string
     try {
       text = aesDecrypt(encryptedMsg, key)
@@ -105,10 +89,13 @@ app.get('/ah', async (c) => {
     const resp = await doStub.fetch('https://do/auth', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ encryptedMsg, serverName }),
+      body: JSON.stringify({
+        encryptedMsg,
+        serverName,
+        userName: userInfo.name,
+      }),
     })
     if (!resp.ok) {
-      recordFailure(ip)
       return c.text(SYNC_CODE.msgAuthFailed, 401)
     }
 
@@ -117,12 +104,12 @@ app.get('/ah', async (c) => {
       clientId: string
       userName: string
     }>()
-    await kv.put(`client:${result.clientId}`, result.userName)
-    clearFailures(ip)
+    await kv.put(`client:${result.clientId}`, result.userName, {
+      expirationTtl: CLIENT_MAPPING_TTL_SECONDS,
+    })
     return c.text(result.encrypted)
   }
 
-  recordFailure(ip)
   return c.text(SYNC_CODE.msgAuthFailed, 401)
 })
 
