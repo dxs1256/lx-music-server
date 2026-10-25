@@ -1,23 +1,41 @@
 import { throttle } from '@/utils/common'
 
-interface SnapshotInfo {
+// A snapshot entry tracked per device. The list and dislike snapshot managers
+// were near-identical (REVIEW L4); the only real difference is the type of the
+// snapshot payload they store. `LX.Sync.List.ListInfo` and
+// `LX.Sync.Dislike.ListInfo` are structurally identical, so this file models
+// them with a single `SnapshotListInfo` and makes the class generic over the
+// stored payload `TData` instead of duplicating the whole manager per feature.
+export interface SnapshotListInfo {
+  lastSyncDate?: number
+  snapshotKey: string
+}
+
+export interface SnapshotInfo {
   latest: string | null
   time: number
   list: string[]
-  clients: Record<string, LX.Sync.Dislike.ListInfo>
+  clients: Record<string, SnapshotListInfo>
 }
 
-export class SnapshotDataManage {
+export class SnapshotDataManage<TData> {
   private storage: DurableObjectStorage
   private prefix: 'list' | 'dislike'
   private maxSnapshotNum: number
   snapshotInfo: SnapshotInfo
+  // Set by `dispose()` when the owning DO is purged. Late writes (throttled
+  // snapshot-index saves, in-flight RPC handlers, socket close flushes) must not
+  // resurrect data after `storage.deleteAll()`.
+  private disposed = false
   // Reference count per snapshot key. Multiple devices can share the same
   // snapshot key, so a plain Set would drop the protection the moment one
   // device moves on — leaving the other device's snapshot free to be cleared
   // (see REVIEW L3). A count only releases a key when every referrer is gone.
   private clientSnapshotKeys = new Map<string, number>()
   private readonly saveSnapshotInfoThrottle: () => void
+  // Converts the serialized payload (a JSON string for list snapshots, the raw
+  // rules string for dislike) into the value actually stored in DO storage.
+  private readonly parseSnapshotData: (data: string) => TData
 
   private incrementRef = (key: string) => {
     if (!key) return
@@ -38,8 +56,19 @@ export class SnapshotDataManage {
     return this.clientSnapshotKeys.has(key)
   }
 
+  // Purge support: after this, no write may reach storage again, so a late
+  // throttled save cannot resurrect a snapshot index after `deleteAll()`.
+  dispose = () => {
+    this.disposed = true
+    this.clientSnapshotKeys.clear()
+  }
+
+  setMaxSnapshotNum = (value: number) => {
+    this.maxSnapshotNum = value
+  }
+
   clearOldSnapshot = async () => {
-    if (!this.snapshotInfo) return
+    if (this.disposed || !this.snapshotInfo) return
     const snapshotList = this.snapshotInfo.list.filter(
       (key) => !this.isIncludesDevice(key),
     )
@@ -56,6 +85,7 @@ export class SnapshotDataManage {
   }
 
   updateDeviceSnapshotKey = async (clientId: string, key: string) => {
+    if (this.disposed) return
     let client = this.snapshotInfo.clients[clientId]
     if (!client)
       client = this.snapshotInfo.clients[clientId] = {
@@ -85,12 +115,14 @@ export class SnapshotDataManage {
   // index (latest/list/time) must survive a DO eviction, so it is written
   // directly and awaited instead of relying on the throttle timer (REVIEW M2).
   saveSnapshotInfo = async (info: SnapshotInfo) => {
+    if (this.disposed) return
     this.snapshotInfo = info
     await this.persistSnapshotInfo()
     await this.clearOldSnapshot()
   }
 
   removeSnapshotInfo = (clientId: string) => {
+    if (this.disposed) return
     const client = this.snapshotInfo.clients[clientId]
     if (!client) return
     if (client.snapshotKey) this.decrementRef(client.snapshotKey)
@@ -99,11 +131,9 @@ export class SnapshotDataManage {
     this.saveSnapshotInfoThrottle()
   }
 
-  getSnapshot = async (
-    name: string,
-  ): Promise<LX.Dislike.DislikeRules | null> => {
+  getSnapshot = async (name: string): Promise<TData | null> => {
     try {
-      const data = await this.storage.get<string>(`${this.prefix}:snap:${name}`)
+      const data = await this.storage.get<TData>(`${this.prefix}:snap:${name}`)
       return data ?? null
     } catch (err) {
       console.error(err)
@@ -112,14 +142,20 @@ export class SnapshotDataManage {
   }
 
   saveSnapshot = async (name: string, data: string) => {
-    await this.storage.put(`${this.prefix}:snap:${name}`, data)
+    if (this.disposed) return
+    await this.storage.put(
+      `${this.prefix}:snap:${name}`,
+      this.parseSnapshotData(data),
+    )
   }
 
   removeSnapshot = async (name: string) => {
+    if (this.disposed) return
     await this.storage.delete(`${this.prefix}:snap:${name}`)
   }
 
   persistSnapshotInfo = async (): Promise<void> => {
+    if (this.disposed) return
     await this.storage.put(`${this.prefix}:snapshotInfo`, this.snapshotInfo)
   }
 
@@ -131,13 +167,14 @@ export class SnapshotDataManage {
     storage: DurableObjectStorage,
     prefix: 'list' | 'dislike',
     preloadedSnapshotInfo: SnapshotInfo,
-    _userName: string,
     maxSnapshotNum: number,
+    parseSnapshotData: (data: string) => TData,
   ) {
     this.storage = storage
     this.prefix = prefix
     this.maxSnapshotNum = maxSnapshotNum
     this.snapshotInfo = preloadedSnapshotInfo
+    this.parseSnapshotData = parseSnapshotData
 
     // Only device removal is throttled now. Its write can only over-protect a
     // snapshot if lost (the stale entry still references the key), never drop

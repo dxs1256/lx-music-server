@@ -1,29 +1,23 @@
 import { toMD5 } from '@/utils'
+import { SnapshotDataManage, type SnapshotInfo } from '../snapshotDataManage'
 import { ListDataManage } from './listDataManage'
-import { SnapshotDataManage } from './snapshotDataManage'
 
 export class ListManage {
-  snapshotDataManage: SnapshotDataManage
+  snapshotDataManage: SnapshotDataManage<LX.Sync.List.ListData>
   listDataManage: ListDataManage
 
   constructor(
     storage: DurableObjectStorage,
-    preloadedSnapshotInfo: {
-      latest: string | null
-      time: number
-      list: string[]
-      clients: Record<string, LX.Sync.List.ListInfo>
-    },
+    preloadedSnapshotInfo: SnapshotInfo,
     preloadedListData: LX.Sync.List.ListData,
-    userName: string,
     maxSnapshotNum: number,
   ) {
     this.snapshotDataManage = new SnapshotDataManage(
       storage,
       'list',
       preloadedSnapshotInfo,
-      userName,
       maxSnapshotNum,
+      (data) => JSON.parse(data) as LX.Sync.List.ListData,
     )
     this.listDataManage = new ListDataManage(preloadedListData)
   }
@@ -59,6 +53,15 @@ export class ListManage {
 
   removeDevice = async (clientId: string) => {
     this.snapshotDataManage.removeSnapshotInfo(clientId)
+  }
+
+  // Admin purge: stop every pending/future snapshot write for this user.
+  dispose = () => {
+    this.snapshotDataManage.dispose()
+  }
+
+  setMaxSnapshotNum = (value: number) => {
+    this.snapshotDataManage.setMaxSnapshotNum(value)
   }
 
   flush = async (): Promise<void> => {

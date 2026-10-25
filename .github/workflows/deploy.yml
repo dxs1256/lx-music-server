@@ -16,6 +16,12 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          # The full history and every tag are required: the display version
+          # carries the commit count since the latest v* tag, which is computed
+          # with `git rev-list --count` below. A shallow clone would silently
+          # under-report it.
+          fetch-depth: 0
+          fetch-tags: true
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
@@ -28,80 +34,111 @@ jobs:
 
       - name: Prepare config and secrets file
         env:
-          KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
+          KV_NAMESPACE_ID: ${{ vars.KV_NAMESPACE_ID }}
           LX_USERS: ${{ secrets.LX_USERS }}
+          LX_ADMIN_PASSWORD_HASH: ${{ secrets.LX_ADMIN_PASSWORD_HASH }}
         run: |
-          # LX_USERS secret 格式:
-          #   简单模式: user1:password1,user2:password2
-          #   JSON 模式: [{"name":"user1","password":"xxx"},{"name":"user2","password":"yyy","maxSnapshotNum":30}]
-          #   JSON 模式也支持 passwordHash: [{"name":"user1","passwordHash":"<32位hex MD5>"}]
+          # LX_USERS secret 格式（可选；仅用于首次播种；播种后由 Registry DO 管理用户）:
+          #   JSON 数组: [{"name":"user1","password":"xxx"},{"name":"user2","password":"yyy","maxSnapshotNum":30}]
+          #   也支持 passwordHash: [{"name":"user1","passwordHash":"<32位hex MD5>"}]
+          #   必须为合法 JSON 数组；未设置或为空则跳过播种，部署继续。
+          # LX_ADMIN_PASSWORD_HASH secret 格式（可选；为空即整体关闭 /admin（404））:
+          #   管理员密码的 SHA-256（64 位小写 hex）。
+          #   注意：从 GitHub Secrets 删除它不会移除 Worker 上已有的 secret，
+          #   停用面板还需手动执行 `wrangler secret delete LX_ADMIN_PASSWORD_HASH`。
           python3 - <<'EOF'
-          import os, json, sys
+          import os, json, re, sys
 
-          # Inject the KV namespace id into wrangler.toml (config, not secret).
-          kv_namespace_id = os.environ.get("KV_NAMESPACE_ID", "")
+          # KV_NAMESPACE_ID 来自仓库 Variable（vars），非 Secret。
+          kv_namespace_id = os.environ.get("KV_NAMESPACE_ID", "").strip()
+          if not kv_namespace_id:
+              print("::error:: KV_NAMESPACE_ID is required: set the repository Variable (vars.KV_NAMESPACE_ID) to the KV namespace id", file=sys.stderr)
+              sys.exit(1)
           with open('wrangler.toml', 'r') as f:
               content = f.read()
           content = content.replace('KV_NAMESPACE_ID_PLACEHOLDER', kv_namespace_id)
           with open('wrangler.toml', 'w') as f:
               f.write(content)
 
-          # Build the LX_USERS secret value (a JSON array string) and write it to
-          # a secrets file that wrangler deploy uploads alongside the code. This
-          # keeps plaintext passwords out of wrangler.toml [vars], which are
-          # visible in the Cloudflare dashboard.
-          raw = os.environ.get("LX_USERS", "").strip()
-          if not raw:
-              print("::error:: LX_USERS secret is empty or missing; refusing to deploy an empty user list", file=sys.stderr)
-              sys.exit(1)
+          secrets = {}
 
-          if raw.startswith("["):
+          # LX_USERS 可选：一次性播种源，线上已播种可不配。有值时必须为合法
+          # JSON 数组，写入 secrets 文件由 wrangler deploy 上传，避免明文密码
+          # 出现在 wrangler.toml [vars]（Cloudflare 控制台可见）。
+          raw = os.environ.get("LX_USERS", "").strip()
+          if raw:
               try:
                   users = json.loads(raw)
               except json.JSONDecodeError as e:
                   print(f"::error:: LX_USERS is not valid JSON: {e}", file=sys.stderr)
                   sys.exit(1)
-          else:
-              users = []
-              for pair in raw.split(","):
-                  pair = pair.strip()
-                  if not pair:
-                      continue
-                  parts = pair.split(":", 1)
-                  users.append({"name": parts[0], "password": parts[1] if len(parts) > 1 else ""})
+              if not isinstance(users, list):
+                  print("::error:: LX_USERS must be a JSON array of user objects", file=sys.stderr)
+                  sys.exit(1)
+              secrets["LX_USERS"] = json.dumps(users)
 
-          if not isinstance(users, list):
-              print("::error:: LX_USERS must be a JSON array of user objects", file=sys.stderr)
+          # LX_ADMIN_PASSWORD_HASH 可选：为空即整体关闭 /admin（404）。有值时
+          # 必须为 64 位十六进制 SHA-256，非法仍报错退出。
+          admin_hash = os.environ.get("LX_ADMIN_PASSWORD_HASH", "").strip().lower()
+          if admin_hash:
+              if not re.fullmatch(r"[0-9a-f]{64}", admin_hash):
+                  print("::error:: LX_ADMIN_PASSWORD_HASH must be a 64-character hex SHA-256 digest", file=sys.stderr)
+                  sys.exit(1)
+              secrets["LX_ADMIN_PASSWORD_HASH"] = admin_hash
+
+          runner_temp = os.environ.get("RUNNER_TEMP", "")
+          if not runner_temp:
+              print("::error:: RUNNER_TEMP is not set in the environment", file=sys.stderr)
               sys.exit(1)
-
-          if not users:
-              print("::error:: LX_USERS resolves to an empty user list; refusing to deploy", file=sys.stderr)
-              sys.exit(1)
-
-          for u in users:
-              if not isinstance(u, dict):
-                  print("::error:: LX_USERS: each entry must be an object", file=sys.stderr)
-                  sys.exit(1)
-              name = u.get("name")
-              if not name:
-                  print("::error:: LX_USERS: every user needs a non-empty 'name'", file=sys.stderr)
-                  sys.exit(1)
-              if not (u.get("password") or u.get("passwordHash")):
-                  print(f"::error:: LX_USERS: user '{name}' needs a non-empty 'password' or 'passwordHash'", file=sys.stderr)
-                  sys.exit(1)
-
-          users_json = json.dumps(users)
-          with open('.secrets.json', 'w') as f:
-              json.dump({"LX_USERS": users_json}, f)
+          secrets_path = os.path.join(runner_temp, "secrets.json")
+          fd = os.open(secrets_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+          with os.fdopen(fd, 'w') as f:
+              json.dump(secrets, f)
           EOF
 
       - name: Deploy
         shell: bash
         run: |
           set -o pipefail
-          pnpm wrangler deploy --secrets-file .secrets.json 2>&1 | sed -E \
+          # Public build metadata (not secrets): the panel's home footer and
+          # about page read it through GET /api/admin/build-info. BUILD_COMMIT
+          # must be the SHA this workflow actually deployed, which under
+          # workflow_run is head_sha, not github.sha.
+          #
+          # Display version, v{package.json version}-{commits since the latest
+          # v* tag}-{7-char commit} (e.g. v1.3.1-2-abc1234). The count needs the
+          # full history and tags fetched above; with no v* tag the checkout
+          # cannot know a base, so the contract falls back to 0.
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          SHORT_SHA="${BUILD_COMMIT:0:7}"
+          if ! [[ "$SHORT_SHA" =~ ^[0-9a-f]{7}$ ]]; then
+            SHORT_SHA="$(git rev-parse --short=7 HEAD)"
+          fi
+
+          LAST_VERSION_TAG="$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)"
+          if [ -n "$LAST_VERSION_TAG" ]; then
+            BUILD_COUNT="$(git rev-list --count "$LAST_VERSION_TAG..HEAD")"
+          else
+            echo "::warning::no v* tag reachable from HEAD; build count falls back to 0"
+            BUILD_COUNT=0
+          fi
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            echo "::warning::shallow clone: the build count may under-report"
+          fi
+
+          BUILD_VERSION="v${PACKAGE_VERSION}-${BUILD_COUNT}-${SHORT_SHA}"
+          echo "build info: version=$BUILD_VERSION commit=$BUILD_COMMIT builtAt=$BUILD_TIME"
+          pnpm wrangler deploy \
+            --secrets-file "$RUNNER_TEMP/secrets.json" \
+            --var "BUILD_VERSION:$BUILD_VERSION" \
+            --var "BUILD_COMMIT:$BUILD_COMMIT" \
+            --var "BUILD_TIME:$BUILD_TIME" 2>&1 | sed -E \
             -e 's/env\.LX_USERS \(".*"\)/env.LX_USERS (***)/g' \
+            -e 's/env\.LX_ADMIN_PASSWORD_HASH \(".*"\)/env.LX_ADMIN_PASSWORD_HASH (***)/g' \
             -e 's/env\.KV[^ ]* \([^)]*\)/env.KV (***)/g' \
             -e 's#https://([a-z0-9-]+)\.[a-z0-9-]+\.workers\.dev/?#https://\1.***.workers.dev/#gI'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          BUILD_COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}

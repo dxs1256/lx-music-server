@@ -1,0 +1,2598 @@
+import { describe, expect, it } from 'vitest'
+import { sha256Hex } from '@/admin/auth'
+import rootApp from '@/index'
+import { adminPageHtml } from '@/pages/admin'
+import { homePageHtml } from '@/pages/home'
+import { registerPageHtml } from '@/pages/register'
+import { updateSettings } from '@/registry/client'
+import adminApp from '@/routes/admin'
+import { createTestEnv } from '@/test/registryEnv'
+import { BREAKPOINTS, baseTokensCss, darkTokensCss } from '@/ui/tokens'
+import app from './pages'
+
+const ADMIN_HASH = 'a'.repeat(64)
+
+// Static markup assertions use a realistic same-origin value for the landing
+// page's server-address row; the live-render tests compare against hono's own
+// default `http://localhost` origin.
+const HOME_ORIGIN = 'https://lx.example.workers.dev'
+
+// One harness for the live-render evidence below (item 2): a real admin
+// session against the real routes, so the four KPI values are the same bytes a
+// browser receives — not a hand-written fixture.
+const loginAdmin = async (password: string, hash: string) => {
+  const { env: baseEnv } = await createTestEnv({ adminPasswordHash: hash })
+  const env = { ...baseEnv, LX_ADMIN_PASSWORD_HASH: hash } as unknown as LX.Env
+  const res = await adminApp.request(
+    '/api/admin/login',
+    { method: 'POST', body: JSON.stringify({ password }) },
+    env,
+  )
+  expect(res.status).toBe(200)
+  const cookie = res.headers.get('set-cookie')?.split(';')[0]
+  expect(cookie).toBeTruthy()
+  return { env, cookie: cookie as string }
+}
+
+const createUser = async (
+  env: LX.Env,
+  cookie: string,
+  name: string,
+  options: { maxSnapshotNum?: number } = {},
+) => {
+  const res = await adminApp.request(
+    '/api/admin/users',
+    {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        name,
+        password: 'correct horse battery staple',
+        ...(options.maxSnapshotNum
+          ? { maxSnapshotNum: options.maxSnapshotNum }
+          : {}),
+      }),
+    },
+    env,
+  )
+  expect([201, 200]).toContain(res.status)
+}
+
+// The four KPI values the panel script builds its dashboard text from. Run
+// through the same kpiNumber exit the page uses, so this is the rendering rule
+// itself, not a second opinion about it.
+const kpiValues = async (env: LX.Env, cookie: string) => {
+  const usersRes = await adminApp.request(
+    '/api/admin/users',
+    { headers: { cookie } },
+    env,
+  )
+  expect(usersRes.status).toBe(200)
+  const { users } = (await usersRes.json()) as {
+    users: Array<{ deviceCount: number | null; status: string }>
+  }
+  const orphansRes = await adminApp.request(
+    '/api/admin/orphans',
+    { headers: { cookie } },
+    env,
+  )
+  expect(orphansRes.status).toBe(200)
+  const orphans = (await orphansRes.json()) as unknown[]
+  const kpiNumber = (value: number) => String(value)
+  return {
+    'kpi-users': kpiNumber(users.length),
+    'kpi-devices': kpiNumber(
+      users.reduce(
+        (total, user) =>
+          total +
+          (typeof user.deviceCount === 'number' &&
+          Number.isFinite(user.deviceCount)
+            ? user.deviceCount
+            : 0),
+        0,
+      ),
+    ),
+    'kpi-pending': kpiNumber(
+      users.filter((user) => user.status === 'pending').length,
+    ),
+    'kpi-orphans': kpiNumber(orphans.length),
+  }
+}
+
+const makeEnv = (hash?: string): LX.Env =>
+  ({ LX_ADMIN_PASSWORD_HASH: hash }) as unknown as LX.Env
+
+describe('page routes', () => {
+  it('hides the admin page when the admin hash is missing', async () => {
+    const res = await app.request('/admin', {}, makeEnv())
+    expect(res.status).toBe(404)
+  })
+
+  it('hides the admin page when the admin hash is malformed', async () => {
+    const res = await app.request('/admin', {}, makeEnv('not-a-hash'))
+    expect(res.status).toBe(404)
+  })
+
+  it('serves the admin page with hardened headers when configured', async () => {
+    const res = await app.request('/admin', {}, makeEnv(ADMIN_HASH))
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('text/html')
+    expect(res.headers.get('cache-control')).toBe('no-store')
+    expect(res.headers.get('content-security-policy')).toContain(
+      "default-src 'none'",
+    )
+    expect(res.headers.get('x-frame-options')).toBe('DENY')
+    expect(await res.text()).toContain('LX Music server 管理面板')
+  })
+
+  it('always serves the register page', async () => {
+    const res = await app.request('/register', {}, makeEnv())
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('text/html')
+    expect(await res.text()).toContain('注册 LX Music 账号')
+  })
+})
+
+describe('landing page', () => {
+  // Every read goes through the real registry DO fixture, so the assertions are
+  // on what a browser gets for a given registration setting.
+  const renderHome = async (mode?: LX.RegistrationMode) => {
+    const { env } = await createTestEnv()
+    if (mode) await updateSettings(env, mode)
+    const res = await app.request('/', {}, env)
+    return { res, html: await res.text() }
+  }
+
+  it('serves `/` as a self-contained landing page instead of 404', async () => {
+    const { res, html } = await renderHome('open')
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toContain('text/html')
+    // The landing page reflects the live registration mode, so it is not cached.
+    expect(res.headers.get('cache-control')).toBe('no-store')
+    expect(html).toContain('<title>LX Music Server · 同步服务</title>')
+    expect(html).toContain('<h1>LX Music server</h1>')
+    expect(html).toContain('一个兼容官方同步协议的重构版')
+    // The server-address row shows the page's own origin, not the old
+    // hardcoded "本页地址（https://…）" placeholder, and the 连接码 row stays put.
+    expect(html).toContain(
+      '<span class="connect-value">http://localhost</span>',
+    )
+    expect(html).not.toContain('本页地址（https://…）')
+    expect(html).toContain(
+      '<span class="connect-value">注册后获得的用户名与密码</span>',
+    )
+    // Nothing to fetch and nothing to execute: the page is correct as served.
+    expect(html).not.toContain('<script')
+    expect(html).toContain('<link rel="icon" href="/favicon.ico" sizes="any">')
+
+    // The document policy is the one the other pages ship: no widening for `/`.
+    const admin = await app.request('/admin', {}, makeEnv(ADMIN_HASH))
+    expect(res.headers.get('content-security-policy')).toBe(
+      admin.headers.get('content-security-policy'),
+    )
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff')
+    expect(res.headers.get('x-frame-options')).toBe('DENY')
+    expect(res.headers.get('referrer-policy')).toBe('no-referrer')
+  })
+
+  it('shows the register entry in open and approval mode', async () => {
+    for (const mode of ['open', 'approval'] as const) {
+      const { html } = await renderHome(mode)
+      expect(html, mode).toContain('id="register-link" href="/register"')
+      expect(html, mode).toContain('注册账号')
+      // No closed/failure copy in an open mode.
+      expect(html, mode).not.toContain('当前未开放自助注册')
+      expect(html, mode).not.toContain('暂时无法读取注册状态')
+    }
+
+    // The two open modes still explain what a registration leads to.
+    expect((await renderHome('open')).html).toContain(
+      '注册成功即可在 LX Music 客户端连接本服务器',
+    )
+    expect((await renderHome('approval')).html).toContain(
+      '提交后需管理员批准才能连接',
+    )
+  })
+
+  it('hides the register entry entirely when registration is closed', async () => {
+    const { html } = await renderHome('closed')
+    // Not merely hidden: the link is absent from the document, so it cannot be
+    // reached from the landing page (or indexed/revealed by a stylesheet).
+    expect(html).not.toContain('/register')
+    expect(html).not.toContain('注册账号')
+    expect(html).toContain('id="register-closed"')
+    expect(html).toContain('当前未开放自助注册')
+    // ...while the admin entry stays.
+    expect(html).toContain('id="admin-link" href="/admin"')
+  })
+
+  it('keeps the admin entry available in every mode', async () => {
+    for (const mode of ['open', 'approval', 'closed'] as const) {
+      const { html } = await renderHome(mode)
+      expect(html, mode).toContain(
+        '<a class="btn primary" id="admin-link" href="/admin">进入管理面板</a>',
+      )
+    }
+  })
+
+  it('still answers 200 without a registration entry when the mode cannot be read', async () => {
+    // No USER_REGISTRY binding at all: the settings read throws. A landing page
+    // must not 500 (or advertise registration) because the registry is down.
+    const res = await app.request('/', {}, makeEnv())
+    expect(res.status).toBe(200)
+    const html = await res.text()
+    expect(html).toBe(homePageHtml(null, 'http://localhost'))
+    expect(html).not.toContain('/register')
+    expect(html).toContain('id="register-unknown"')
+    expect(html).toContain('暂时无法读取注册状态')
+    expect(html).toContain('id="admin-link" href="/admin"')
+  })
+
+  it('shows the deploy version in the footer and drops the sync hint', async () => {
+    // The footer no longer carries the old sync hint: it shows the display
+    // version injected by the deploy workflow — the full
+    // v{version}-{build count}-{short sha} string — or "dev" when the var is
+    // not injected. It is printed verbatim, never re-prefixed, so the landing
+    // footer reads the same as the admin panel.
+    const { env } = await createTestEnv()
+
+    const devHtml = await (await app.request('/', {}, env)).text()
+    expect(devHtml).not.toContain('在 LX Music 客户端里填写本页地址')
+    expect(devHtml).toContain('<footer>dev</footer>')
+
+    const injected = {
+      ...env,
+      BUILD_VERSION: 'v1.3.1-2-abc1234',
+    } as unknown as LX.Env
+    const injectedHtml = await (await app.request('/', {}, injected)).text()
+    // Verbatim: no doubled `vv...` prefix from the page layer.
+    expect(injectedHtml).toContain('<footer>v1.3.1-2-abc1234</footer>')
+    expect(injectedHtml).not.toContain('<footer>vv1.3.1-2-abc1234')
+  })
+
+  it('keeps every neighbouring route untouched', async () => {
+    // `/` used to fall through the composed app to a 404; the mounted router is
+    // what a browser hits, so the mount itself is checked here.
+    const { env } = await createTestEnv()
+    const res = await rootApp.request('/', {}, env)
+    expect(res.status).toBe(200)
+    expect(await res.text()).toContain('id="admin-link" href="/admin"')
+
+    expect((await rootApp.request('/hello', {}, env)).status).toBe(200)
+    expect((await rootApp.request('/register', {}, env)).status).toBe(200)
+    expect((await rootApp.request('/favicon.ico', {}, env)).status).toBe(200)
+    // An unconfigured deployment still hides the admin panel.
+    expect((await rootApp.request('/admin', {}, env)).status).toBe(404)
+  })
+
+  it('follows the live registration setting on every request', async () => {
+    // Rendered per request from the same settings `/api/registration-info`
+    // reports, so a mode switch takes effect on the next load with no cache to
+    // purge. `createTestEnv()` starts on the default `approval`.
+    const { env } = await createTestEnv()
+    const html = async () => (await app.request('/', {}, env)).text()
+
+    expect(await html()).toContain('href="/register"')
+    await updateSettings(env, 'closed')
+    expect(await html()).not.toContain('/register')
+    await updateSettings(env, 'open')
+    expect(await html()).toContain('href="/register"')
+  })
+})
+
+// Every branch of the landing page is checked by the markup safety rules below,
+// not only the state the unit test happens to construct.
+const pages: Array<[string, string]> = [
+  ['admin', adminPageHtml],
+  ['register', registerPageHtml],
+  ['home (registration open)', homePageHtml('open', HOME_ORIGIN)],
+  ['home (registration approval)', homePageHtml('approval', HOME_ORIGIN)],
+  ['home (registration closed)', homePageHtml('closed', HOME_ORIGIN)],
+  ['home (registration mode unknown)', homePageHtml(null, HOME_ORIGIN)],
+]
+
+// Markup that makes the browser fetch something from another origin. A plain
+// `<a href="https://...">` is user navigation, not a load, so it is allowed on
+// purpose (the about tab links to the public repository).
+//
+// Rules: matching is case-insensitive (HTML attribute names and CSS function
+// names are), quoted and unquoted attribute values are both caught, and any
+// whitespace after `=` or after the opening quote is skipped.
+//
+// Covered resource entry points: `src` / `srcset` (script, img, iframe, video,
+// audio, source, embed, track, input, data-src-style lazy loaders…), `<link
+// href>` (stylesheet, preload, icon), `object data`, iframe `srcdoc`, `poster`
+// (video), the legacy `background` attribute, CSS `url()` and `@import`.
+//
+// Known gaps, deliberate: `<meta http-equiv="refresh" content="0;url=...">` is
+// navigation rather than a subresource load (same as an anchor), and HTML
+// entity-encoded URLs (`&#104;ttps://...`) are not decoded by these regexes.
+// Both pages are also served with CSP `default-src 'none'`, so a variant that
+// slips past a rule still cannot load anything.
+//
+// `@import` is banned unconditionally, including same-origin and relative
+// imports: both pages are single self-contained documents, so any import is a
+// violation. The self-test below pins that policy down.
+const EXTERNAL_RESOURCE_PATTERNS: Record<string, RegExp> = {
+  src: /\bsrc\s*=\s*["']?\s*(?:https?:)?\/\//i,
+  srcset: /\bsrcset\s*=\s*["']?\s*(?:https?:)?\/\//i,
+  'object data': /\bdata\s*=\s*["']?\s*(?:https?:)?\/\//i,
+  'iframe srcdoc': /\bsrcdoc\s*=\s*["']?\s*(?:https?:)?\/\//i,
+  'video poster': /\bposter\s*=\s*["']?\s*(?:https?:)?\/\//i,
+  'body background': /\bbackground\s*=\s*["']?\s*(?:https?:)?\/\//i,
+  '<link href>': /<link\b[^>]*\bhref\s*=\s*["']?\s*(?:https?:)?\/\//i,
+  '@import': /@import/i,
+  'css url()': /url\(\s*["']?\s*(?:https?:)?\/\//i,
+}
+
+describe('page markup safety', () => {
+  // Slice of the inline script between two markers, so an assertion can only
+  // pass on the code it names. Both markers must exist and come in order.
+  const section = (start: string, end: string): string => {
+    const from = adminPageHtml.indexOf(start)
+    expect(from, `missing start marker: ${start}`).toBeGreaterThan(-1)
+    const to = adminPageHtml.indexOf(end, from + start.length)
+    expect(to, `missing end marker: ${end}`).toBeGreaterThan(from)
+    return adminPageHtml.slice(from, to)
+  }
+
+  for (const [name, html] of pages) {
+    it(`${name} page has no HTML injection sinks`, () => {
+      expect(html).not.toMatch(
+        /innerHTML|outerHTML|insertAdjacentHTML|document\.write/,
+      )
+    })
+
+    it(`${name} page loads no external resources`, () => {
+      for (const [label, pattern] of Object.entries(
+        EXTERNAL_RESOURCE_PATTERNS,
+      )) {
+        expect(html, `external ${label}`).not.toMatch(pattern)
+      }
+    })
+  }
+
+  it('external resource guard still catches real loads', () => {
+    // Every entry must be caught by the named rule, so a rule cannot silently
+    // stop covering the variant it exists for.
+    const violations: Array<[string, string]> = [
+      ['<script src="https://cdn.example/x.js"></script>', 'src'],
+      ['<script src=https://cdn.example/x.js></script>', 'src'],
+      ['<SCRIPT SRC="https://cdn.example/x.js"></SCRIPT>', 'src'],
+      ['<img src="//cdn.example/x.png">', 'src'],
+      // Whitespace after the `=` and after the opening quote is still a load.
+      ['<script src=  https://cdn.example/x.js></script>', 'src'],
+      ['<img src=" https://cdn.example/x.png">', 'src'],
+      ['<img srcset="https://cdn.example/x.png 1x">', 'srcset'],
+      [
+        '<link rel="stylesheet" href="https://cdn.example/x.css">',
+        '<link href>',
+      ],
+      ['<link rel=stylesheet href=https://cdn.example/x.css>', '<link href>'],
+      ['<object data="https://cdn.example/x.swf"></object>', 'object data'],
+      ['<iframe srcdoc="//cdn.example/x.html"></iframe>', 'iframe srcdoc'],
+      ['<video poster=https://cdn.example/x.jpg></video>', 'video poster'],
+      ['<VIDEO POSTER="https://cdn.example/x.jpg"></VIDEO>', 'video poster'],
+      ['<body background="https://cdn.example/x.png">', 'body background'],
+      ['<BODY BACKGROUND=https://cdn.example/x.png>', 'body background'],
+      ['<style>@import "x.css";</style>', '@import'],
+      ['<style>@import url(https://cdn.example/x.css);</style>', '@import'],
+      [
+        '<style>.a { background: url(https://cdn.example/x.png); }</style>',
+        'css url()',
+      ],
+      [
+        '<style>.a { background: URL(https://cdn.example/x.png); }</style>',
+        'css url()',
+      ],
+    ]
+    for (const [sample, label] of violations) {
+      expect(EXTERNAL_RESOURCE_PATTERNS[label], label).toBeDefined()
+      expect(
+        EXTERNAL_RESOURCE_PATTERNS[label].test(sample),
+        `${label}: ${sample}`,
+      ).toBe(true)
+      expect(
+        Object.values(EXTERNAL_RESOURCE_PATTERNS).some((pattern) =>
+          pattern.test(sample),
+        ),
+        sample,
+      ).toBe(true)
+    }
+
+    // Same-origin or inline references are not external loads, and neither is
+    // user navigation (an anchor, a meta refresh target).
+    const allowed = [
+      '<script src="/static/app.js"></script>',
+      '<img src="data:image/png;base64,AAAA">',
+      '<link rel="icon" href="data:,">',
+      '<video poster="/static/poster.jpg"></video>',
+      '<a href="https://github.com/WorkerHub/lx-music-server">repo</a>',
+      '<a href=https://github.com/WorkerHub/lx-music-server>repo</a>',
+      '<a href=" https://github.com/WorkerHub/lx-music-server">repo</a>',
+      '<meta http-equiv="refresh" content="0;url=https://example.com">',
+    ]
+    for (const sample of allowed) {
+      expect(
+        Object.values(EXTERNAL_RESOURCE_PATTERNS).some((pattern) =>
+          pattern.test(sample),
+        ),
+        sample,
+      ).toBe(false)
+    }
+  })
+
+  it('keeps the required admin confirmation copy', () => {
+    expect(adminPageHtml).toContain('同步数据保留')
+    expect(adminPageHtml).toContain('不可恢复')
+    expect(adminPageHtml).toContain('同时删除该用户全部设备')
+  })
+
+  it('splits the admin panel into users and settings tabs', () => {
+    expect(adminPageHtml).toContain('id="tab-users"')
+    expect(adminPageHtml).toContain('id="tab-settings"')
+    expect(adminPageHtml).toContain('用户管理')
+    expect(adminPageHtml).toContain('系统设置')
+    expect(adminPageHtml).toContain("'#users'")
+    expect(adminPageHtml).toContain("'#settings'")
+
+    const usersPanel = adminPageHtml.slice(
+      adminPageHtml.indexOf('id="tab-panel-users"'),
+      adminPageHtml.indexOf('id="tab-panel-settings"'),
+    )
+    expect(usersPanel).toContain('id="users-body"')
+    expect(usersPanel).toContain('id="add-form"')
+    expect(usersPanel.indexOf('用户')).toBeLessThan(
+      usersPanel.indexOf('添加用户'),
+    )
+
+    const settingsPanel = adminPageHtml.slice(
+      adminPageHtml.indexOf('id="tab-panel-settings"'),
+      adminPageHtml.indexOf('id="tab-panel-about"'),
+    )
+    expect(settingsPanel).toContain('id="mode-options"')
+    expect(settingsPanel).toContain('id="orphans-body"')
+    expect(settingsPanel.indexOf('注册设置')).toBeLessThan(
+      settingsPanel.indexOf('数据残留'),
+    )
+    // The slice must stop at the panel boundary instead of running to EOF.
+    expect(settingsPanel).not.toContain('id="about-repo"')
+    expect(usersPanel).not.toContain('id="about-repo"')
+  })
+
+  it('paginates the users list client-side (10 per page)', () => {
+    // The pager container lives between the table and the empty state, so it
+    // starts hidden and only the script can reveal it.
+    const usersPanel = adminPageHtml.slice(
+      adminPageHtml.indexOf('id="tab-panel-users"'),
+      adminPageHtml.indexOf('id="tab-panel-settings"'),
+    )
+    expect(usersPanel.indexOf('id="users-pager"')).toBeGreaterThan(
+      usersPanel.indexOf('id="users-table-wrap"'),
+    )
+    expect(usersPanel.indexOf('id="users-pager"')).toBeLessThan(
+      usersPanel.indexOf('id="users-empty"'),
+    )
+
+    // The page size is a named constant, not a magic number scattered around.
+    expect(adminPageHtml).toContain('var USER_PAGE_SIZE = 10')
+
+    // The current page starts at 1 and is reset with the rest of the session.
+    const stateBlock = adminPageHtml.slice(
+      adminPageHtml.indexOf('var state = {'),
+      adminPageHtml.indexOf('var modalState = {'),
+    )
+    expect(stateBlock).toContain('userPage: 1')
+
+    const resetData = section('function resetData', 'function endSession')
+    expect(resetData).toContain('state.userPage = 1')
+
+    // renderUsers clamps to [1, pageCount] and renders only the current slice.
+    const renderUsers = section(
+      'function renderUsers()',
+      'function renderOrphans',
+    )
+    expect(renderUsers).toContain(
+      'Math.ceil(state.users.length / USER_PAGE_SIZE)',
+    )
+    expect(renderUsers).toContain(
+      'state.users.slice(start, start + USER_PAGE_SIZE)',
+    )
+    expect(
+      renderUsers.indexOf('if (state.userPage < 1) state.userPage = 1'),
+    ).toBeLessThan(renderUsers.indexOf('state.users.slice(start'))
+    expect(
+      renderUsers.indexOf(
+        'if (state.userPage > pageCount) state.userPage = pageCount',
+      ),
+    ).toBeLessThan(renderUsers.indexOf('state.users.slice(start'))
+
+    // Controls are built with el()/button(), never concatenated HTML strings.
+    const ensurePager = section(
+      'function ensureUsersPager()',
+      'function renderUsersPager',
+    )
+    expect(ensurePager).toContain("button('上一页', 'btn sm'")
+    expect(ensurePager).toContain("button('下一页', 'btn sm'")
+    expect(ensurePager).toContain("el('span', 'pager-info')")
+
+    // The pager is shown only when more than one page of users exists, and the
+    // prev/next disabled states track the first/last page.
+    const renderUsersPager = section(
+      'function renderUsersPager',
+      'function renderUsers()',
+    )
+    expect(renderUsersPager).toContain('state.users.length > USER_PAGE_SIZE')
+    expect(renderUsersPager).toContain('state.userPage <= 1')
+    expect(renderUsersPager).toContain('state.userPage >= pageCount')
+  })
+
+  it('renders 最后登录 right after 创建时间 in the users table', () => {
+    const usersPanel = adminPageHtml.slice(
+      adminPageHtml.indexOf('id="tab-panel-users"'),
+      adminPageHtml.indexOf('id="tab-panel-settings"'),
+    )
+    // The header pins the whole column order, so the new column can neither
+    // drift away from 创建时间 nor silently push another column out.
+    const headerCells = (usersPanel.match(/<th[^>]*>[^<]*<\/th>/g) ?? []).map(
+      (cell) => cell.replace(/<[^>]+>/g, ''),
+    )
+    expect(headerCells).toEqual([
+      '用户名',
+      '状态',
+      '来源',
+      '创建时间',
+      '最后登录',
+      '设备数',
+      '快照上限',
+      '操作',
+    ])
+
+    // Each row emits the same cells in the same order. lastSeenAt comes from
+    // GET /api/admin/users as epoch ms (null = 从未登录) and goes through
+    // formatTime, the single place that turns a missing value into 「—」.
+    const renderUsers = section(
+      'function renderUsers()',
+      'function addUserActions',
+    )
+    const createdCell = "cell('创建时间', 'muted', formatTime(user.createdAt))"
+    const lastSeenCell =
+      "cell('最后登录', 'muted', formatTime(user.lastSeenAt))"
+    expect(renderUsers).toContain(createdCell)
+    expect(renderUsers).toContain(lastSeenCell)
+    expect(renderUsers.indexOf(createdCell)).toBeLessThan(
+      renderUsers.indexOf(lastSeenCell),
+    )
+    // Header and body stay the same width: 8 cells per row.
+    expect(renderUsers.match(/row\.appendChild\(/g) ?? []).toHaveLength(8)
+
+    // Behaviour, not only source: run formatTime itself, so 「从未登录 → —」 and
+    // 「有值 → 本地时间字符串」 are pinned the way a browser would see them.
+    const formatTimeFn = section('function formatTime', 'function labelFrom')
+    const formatTime = new Function(`${formatTimeFn}\nreturn formatTime`)() as (
+      value: unknown,
+    ) => string
+    expect(formatTime(null)).toBe('—')
+    expect(formatTime(undefined)).toBe('—')
+    const seenAt = Date.UTC(2025, 0, 2, 3, 4, 5)
+    const rendered = formatTime(seenAt)
+    expect(rendered).not.toBe('—')
+    expect(rendered).not.toContain('Invalid')
+    expect(rendered).toContain(':')
+    expect(rendered).toBe(
+      new Date(seenAt).toLocaleString('zh-CN', { hour12: false }),
+    )
+  })
+
+  it('paints the 最后登录 cell from lastSeenAt, with a placeholder when never seen', () => {
+    // The row is the deliverable, so renderUsers() runs against a fake DOM
+    // instead of being pinned by string matching: a source assertion would
+    // stay green for any expression that still renders the wrong cell.
+    const source = section('function renderUsers()', 'function addUserActions')
+    const makeNode = (tag = 'div'): any => {
+      const node: any = {
+        tagName: tag,
+        className: '',
+        textContent: '',
+        title: '',
+        type: '',
+        hidden: false,
+        disabled: false,
+        children: [],
+      }
+      node.firstChild = null
+      node.appendChild = (child: any) => {
+        node.children.push(child)
+        node.firstChild = node.children[0] ?? null
+        return child
+      }
+      node.removeChild = (child: any) => {
+        const index = node.children.indexOf(child)
+        if (index >= 0) node.children.splice(index, 1)
+        node.firstChild = node.children[0] ?? null
+        return child
+      }
+      node.setAttribute = (key: string, value: string) => {
+        node[key] = value
+      }
+      node.addEventListener = () => {}
+      return node
+    }
+    const document = { createElement: (tag: string) => makeNode(tag) }
+    const nodes: Record<string, any> = {}
+    const $ = (id: string) => {
+      nodes[id] = nodes[id] ?? makeNode()
+      return nodes[id]
+    }
+    const formatTime = new Function(
+      `${section('function formatTime', 'function labelFrom')}\nreturn formatTime`,
+    )() as (value: unknown) => string
+    const el = (tag: string, className?: string, text?: string) => {
+      const node = makeNode(tag)
+      if (className) node.className = className
+      if (text !== undefined && text !== null) node.textContent = String(text)
+      return node
+    }
+    const cell = (label: string, className: string | null, text?: string) => {
+      const node = el('td', className ?? undefined, text)
+      node.setAttribute('data-label', label)
+      return node
+    }
+    const user = (name: string, lastSeenAt: number | null) => ({
+      name,
+      status: 'active',
+      source: 'self',
+      createdAt: '2025-01-02T03:04:05Z',
+      lastSeenAt,
+      deviceCount: 1,
+      maxSnapshotNum: null,
+    })
+    const seenAt = Date.UTC(2025, 2, 4, 5, 6, 7)
+    const state = {
+      usersLoaded: true,
+      users: [user('seen', seenAt), user('never', null)],
+      userPage: 1,
+    }
+    const renderUsers = new Function(
+      'state',
+      'USER_PAGE_SIZE',
+      '$',
+      'document',
+      'clear',
+      'el',
+      'cell',
+      'formatTime',
+      'labelFrom',
+      'STATUS_LABELS',
+      'SOURCE_LABELS',
+      'statusClass',
+      'renderUsersCount',
+      'ensureUsersPager',
+      'renderUsersPager',
+      'addUserActions',
+      'renderHome',
+      `${source}\nreturn renderUsers`,
+    )(
+      state,
+      10,
+      $,
+      document,
+      (node: any) => {
+        node.children = []
+        node.firstChild = null
+      },
+      el,
+      cell,
+      formatTime,
+      (map: Record<string, string>, value: string) =>
+        map[value] || String(value || '未知'),
+      { active: '正常', pending: '待批准', disabled: '已禁用' },
+      { imported: '部署导入', self: '自助注册', admin: '管理员添加' },
+      () => '',
+      () => {},
+      () => ({}),
+      () => {},
+      () => {},
+      () => {},
+    ) as () => void
+    renderUsers()
+
+    const rows = $('users-body').children
+    expect(rows).toHaveLength(2)
+    const labelOf = (tr: any, label: string) =>
+      tr.children.findIndex((td: any) => td['data-label'] === label)
+    const cellOf = (tr: any, label: string) =>
+      tr.children.find((td: any) => td['data-label'] === label)
+    for (const tr of rows) {
+      // The new column keeps the header order: right after 创建时间.
+      expect(labelOf(tr, '最后登录')).toBe(labelOf(tr, '创建时间') + 1)
+      expect(tr.children).toHaveLength(8)
+    }
+    // A user who authenticated shows the formatted local time...
+    expect(cellOf(rows[0], '最后登录').textContent).toBe(formatTime(seenAt))
+    expect(cellOf(rows[0], '最后登录').className).toBe('muted')
+    expect(cellOf(rows[0], '最后登录').textContent).not.toBe('—')
+    // ...while a user without lastSeenAt (null) gets the 「—」placeholder.
+    expect(cellOf(rows[1], '最后登录').textContent).toBe('—')
+  })
+
+  it('expands the admin panel to four tabs in a fixed order', () => {
+    const tabs: Array<[string, string, string]> = [
+      ['home', '首页', "'#home'"],
+      ['users', '用户管理', "'#users'"],
+      ['settings', '系统设置', "'#settings'"],
+      ['about', '关于', "'#about'"],
+    ]
+
+    const positions = tabs.map(([name, label, hash]) => {
+      expect(adminPageHtml).toContain(`id="tab-${name}"`)
+      expect(adminPageHtml).toContain(`id="tab-panel-${name}"`)
+      expect(adminPageHtml).toContain(hash)
+      expect(adminPageHtml).toContain(label)
+      return adminPageHtml.indexOf(`id="tab-${name}"`)
+    })
+    expect(positions).toEqual([...positions].sort((a, b) => a - b))
+  })
+
+  it('lands on the home tab by default and falls back to it', () => {
+    expect(adminPageHtml).toContain("var DEFAULT_TAB = 'home'")
+    expect(adminPageHtml).toContain("home: '#home'")
+    expect(adminPageHtml.indexOf('id="tab-panel-home"')).toBeLessThan(
+      adminPageHtml.indexOf('id="tab-panel-users"'),
+    )
+
+    const tabFromHash = adminPageHtml.slice(
+      adminPageHtml.indexOf('function tabFromHash'),
+      adminPageHtml.indexOf('function activateTab'),
+    )
+    expect(tabFromHash).toContain('return DEFAULT_TAB')
+    expect(tabFromHash).not.toContain('users')
+  })
+
+  it('renders the home dashboard containers', () => {
+    const containers = [
+      'kpi-users',
+      'kpi-devices',
+      'kpi-pending',
+      'kpi-orphans',
+      'todo-list',
+      'recent-body',
+      'recent-empty',
+      'chart-bars',
+      'chart-total',
+      'build-line',
+    ]
+    for (const id of containers) {
+      expect(adminPageHtml).toContain(`id="${id}"`)
+    }
+
+    expect(adminPageHtml).toContain('用户总数')
+    expect(adminPageHtml).toContain('设备总数')
+    expect(adminPageHtml).toContain('待审批')
+    expect(adminPageHtml).toContain('数据残留')
+    expect(adminPageHtml).toContain('最近注册')
+    expect(adminPageHtml).toContain('近 30 天新增')
+    expect(adminPageHtml).toContain('暂无待处理事项')
+    expect(adminPageHtml).toContain("'/api/admin/build-info'")
+  })
+
+  it('renders the about page build fields and repository link', () => {
+    expect(adminPageHtml).toContain('id="tab-panel-about"')
+
+    const fields = [
+      'about-version',
+      'about-commit',
+      'about-built',
+      'about-repo',
+    ]
+    for (const id of fields) {
+      expect(adminPageHtml).toContain(`id="${id}"`)
+    }
+
+    expect(adminPageHtml).toContain('版本号')
+    expect(adminPageHtml).toContain('构建哈希')
+    expect(adminPageHtml).toContain('构建时间')
+
+    // The repository link is static markup, not a runtime-injected href, so a
+    // reader of the document can see where it points.
+    const anchor =
+      adminPageHtml.match(/<a\b[^>]*id="about-repo"[^>]*>/)?.[0] ?? ''
+    expect(anchor).toContain(
+      'href="https://github.com/WorkerHub/lx-music-server"',
+    )
+    expect(anchor).toContain('target="_blank"')
+    expect(anchor).toContain('rel="noopener noreferrer"')
+    expect(adminPageHtml).not.toMatch(/setAttribute\s*\(\s*['"]href['"]/)
+
+    // dev builds must fall back to 'dev' / '—' instead of undefined or null.
+    expect(adminPageHtml).toContain("commit === 'dev'")
+    expect(adminPageHtml).toContain("'—'")
+  })
+
+  it('shows the injected version verbatim in the footer and the about page', () => {
+    // The deploy workflow now injects the full display string
+    // v{version}-{build count}-{7-char sha}. The page must print it as-is:
+    // no extra "v" prefix, no separately appended short commit. Otherwise the
+    // dashboard footer and the about page disagree with the landing footer.
+
+    // versionText() is a pass-through of buildVersion(), whose only reshaping
+    // is the 'dev' fallback for un-injected builds.
+    const versionText = section('function versionText()', 'async function')
+    expect(versionText).toMatch(/return buildVersion\(\)/)
+    expect(versionText).not.toContain("'v' +")
+    expect(adminPageHtml).not.toContain("'v' + version")
+    expect(adminPageHtml).not.toContain('function shortCommit(')
+    // The 'dev' fallback for un-injected builds lives in buildVersion().
+    const buildVersion = section(
+      'function buildVersion()',
+      'function buildCommit()',
+    )
+    expect(buildVersion).toContain(": 'dev'")
+
+    // Footer line: the version alone, since the short sha is inside it.
+    const renderBuildInfo = section(
+      'function renderBuildInfo()',
+      'function renderAbout()',
+    )
+    expect(renderBuildInfo).toContain('line.textContent = versionText()')
+    expect(renderBuildInfo).not.toContain("' · '")
+    expect(renderBuildInfo).not.toContain('buildCommit()')
+
+    // About page: 版本号 carries the same full string, 提交 still the full sha.
+    const renderAbout = section('function renderAbout()', 'function openModal(')
+    expect(renderAbout).toContain(
+      "$('about-version').textContent = versionText()",
+    )
+    expect(renderAbout).toContain("$('about-commit').textContent = commit")
+    expect(renderAbout).not.toContain("about-commit').textContent = short")
+  })
+
+  it('renders the same version string on all three surfaces (ONE-295)', () => {
+    // Source assertions cannot see what the script actually paints. This runs
+    // the real build-info functions (extracted from the page) against a stubbed
+    // DOM, then compares them with the landing footer rendered by
+    // homePageHtml(), so the three surfaces are checked against one value.
+    const source = `
+${section('function buildVersion()', 'async function loadBuildInfo')}
+${section('function renderBuildInfo()', 'function openModal(')}
+return { versionText: versionText, renderBuildInfo: renderBuildInfo, renderAbout: renderAbout }
+`
+    const nodes: Record<string, { textContent: string; hidden: boolean }> = {
+      'build-line': { textContent: '', hidden: true },
+      'about-version': { textContent: '', hidden: false },
+      'about-commit': { textContent: '', hidden: false },
+      'about-built': { textContent: '', hidden: false },
+    }
+    const state: { build: unknown } = { build: null }
+    const $ = (id: string) => nodes[id]
+    const render = new Function('state', '$', 'formatTime', source) as (
+      state: unknown,
+      $: unknown,
+      formatTime: unknown,
+    ) => {
+      versionText: () => string
+      renderBuildInfo: () => void
+      renderAbout: () => void
+    }
+    const page = render(state, $, () => '2026-10-21 06:47')
+
+    const display = 'v1.3.1-2-abc1234'
+    const fullSha = '9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c'
+    state.build = { version: display, commit: fullSha, builtAt: null }
+    page.renderBuildInfo()
+    page.renderAbout()
+
+    // 未登录页底部 == 已登录页底部 == 关于页「版本号」：完全一致。
+    const landingFooter = homePageHtml(null, HOME_ORIGIN, display).match(
+      /<footer>(.*)<\/footer>/,
+    )?.[1]
+    expect(landingFooter).toBe(display)
+    expect(nodes['build-line'].textContent).toBe(display)
+    expect(nodes['about-version'].textContent).toBe(display)
+    expect(nodes['build-line'].textContent).toBe(
+      nodes['about-version'].textContent,
+    )
+    // No doubled `v` and no trailing " · shortsha" appended by the page.
+    expect(nodes['build-line'].textContent).not.toContain(' · ')
+    expect(nodes['build-line'].hidden).toBe(false)
+    // 关于页「提交」行仍是全 SHA，不受影响。
+    expect(nodes['about-commit'].textContent).toBe(fullSha)
+    expect(nodes['about-commit'].textContent).toHaveLength(40)
+
+    // Un-injected dev build: all three still agree on 'dev'.
+    state.build = null
+    page.renderBuildInfo()
+    page.renderAbout()
+    expect(nodes['about-version'].textContent).toBe('dev')
+    expect(homePageHtml(null, HOME_ORIGIN)).toContain('<footer>dev</footer>')
+  })
+
+  it('keeps orphan counts unknown until the list actually loads', () => {
+    expect(adminPageHtml).toContain('orphansLoaded: false')
+    // The KPI starts unknown, never a confident 0.
+    expect(adminPageHtml).toContain('id="kpi-orphans">—<')
+
+    const loadOrphans = adminPageHtml.slice(
+      adminPageHtml.indexOf('async function loadOrphans'),
+      adminPageHtml.indexOf('async function loadMode'),
+    )
+    expect(loadOrphans).toContain('state.orphansLoaded = true')
+    expect(loadOrphans).toContain('state.orphansLoaded = false')
+    expect(loadOrphans.indexOf('state.orphansLoaded = false')).toBeLessThan(
+      loadOrphans.indexOf('state.orphansLoaded = true'),
+    )
+
+    const renderHome = adminPageHtml.slice(
+      adminPageHtml.indexOf('function renderHome'),
+      adminPageHtml.indexOf('function renderTodo'),
+    )
+    expect(renderHome).toContain('state.orphansLoaded')
+    expect(renderHome).toContain('UNKNOWN')
+
+    const renderTodo = adminPageHtml.slice(
+      adminPageHtml.indexOf('function renderTodo'),
+      adminPageHtml.indexOf('function todoItem'),
+    )
+    // The orphan reminder and the "nothing to do" copy are both gated on the
+    // list having loaded; the unknown branch replaces them.
+    expect(renderTodo).toContain('if (state.orphansLoaded)')
+    expect(renderTodo).toContain('数据残留待处理：—')
+    expect(
+      renderTodo.indexOf("el('p', 'empty', '暂无待处理事项')"),
+    ).toBeGreaterThan(renderTodo.indexOf('list.childNodes.length === 0'))
+  })
+
+  it('clears the previous session out of the DOM on logout and on 401', () => {
+    // The reset helper must drop the data and re-render both tables: without
+    // the renders the old rows (and their 删除账号 / 彻底清理 buttons) stay
+    // clickable until the next load returns.
+    const resetData = adminPageHtml.slice(
+      adminPageHtml.indexOf('function resetData'),
+      adminPageHtml.indexOf('function endSession'),
+    )
+    expect(resetData).toContain('state.users = []')
+    expect(resetData).toContain('state.orphans = []')
+    expect(resetData).toContain('state.usersLoaded = false')
+    expect(resetData).toContain('state.orphansLoaded = false')
+    expect(resetData).toContain('state.build = null')
+    // The mode read state is reset too — to "not read yet", never to "failed".
+    expect(resetData).toContain("state.modeStatus = 'idle'")
+    // The previous session's registration mode must not stay selected either.
+    expect(resetData).toContain("state.mode = ''")
+    // In-flight responses from the ended session are invalidated here.
+    expect(resetData).toContain('sessionEpoch++')
+    // Every renderer the panel has, not just the two tables: the dashboard,
+    // the settings radios, the build footer and the about fields all fall back
+    // to their unknown/empty state in the same tick.
+    expect(resetData).toContain('renderUsers()')
+    expect(resetData).toContain('renderOrphans()')
+    expect(resetData).toContain('renderMode()')
+    expect(resetData).toContain('renderBuildInfo()')
+    expect(resetData).toContain('renderAbout()')
+
+    // Logout goes through that helper instead of only clearing state, and the
+    // login view is shown after the DOM has been reset.
+    const logout = adminPageHtml.slice(
+      adminPageHtml.indexOf("$('logout-btn').addEventListener"),
+      adminPageHtml.indexOf("$('add-form').addEventListener"),
+    )
+    expect(logout).toContain('endSession(')
+    expect(logout).not.toContain('showLogin(')
+    expect(logout).not.toContain('state.users = []')
+
+    const endSession = adminPageHtml.slice(
+      adminPageHtml.indexOf('function endSession'),
+      adminPageHtml.indexOf('function showLogin'),
+    )
+    expect(endSession).toContain('resetData()')
+    expect(endSession.indexOf('resetData()')).toBeLessThan(
+      endSession.indexOf('showLogin('),
+    )
+
+    // Expired sessions (401) take the same path, including the modal submit
+    // branch that handles 401 itself instead of calling handleAuth.
+    const handleAuth = adminPageHtml.slice(
+      adminPageHtml.indexOf('function handleAuth'),
+      adminPageHtml.indexOf('function resetData'),
+    )
+    expect(handleAuth).toContain('err.status !== 401')
+    expect(handleAuth).toContain('endSession(')
+
+    const runModalSubmit = adminPageHtml.slice(
+      adminPageHtml.indexOf('async function runModalSubmit'),
+      adminPageHtml.indexOf('function openRejectModal'),
+    )
+    expect(runModalSubmit).toContain('endSession(')
+    expect(runModalSubmit).not.toContain('showLogin(')
+  })
+
+  it('shows a neutral loading copy for the registration mode until the read fails', () => {
+    // A pending read is not a failure: the hint has to distinguish "not read
+    // yet / reading" from "the read failed", otherwise the ~1.5s between a
+    // fresh login and /api/registration-info returning shows 读取失败.
+    const renderMode = section('function renderMode', '// --- Home dashboard')
+    expect(renderMode).toContain("var ready = state.modeStatus === 'ready'")
+    expect(renderMode).toContain('radios[i].disabled = !ready')
+    // The failure copy is gated on 'error' and is not the catch-all branch.
+    expect(renderMode).toContain("state.modeStatus === 'error'")
+    expect(renderMode).toContain('正在读取注册模式…')
+    expect(renderMode).toContain('注册模式读取失败')
+    expect(renderMode.indexOf("state.modeStatus === 'error'")).toBeLessThan(
+      renderMode.indexOf('注册模式读取失败'),
+    )
+    // The neutral copy is the fallback of that ternary (idle / loading), and
+    // each copy appears exactly once in the page — the failure text cannot be
+    // reached without the 'error' check above.
+    expect(renderMode.indexOf('注册模式读取失败')).toBeLessThan(
+      renderMode.indexOf('正在读取注册模式…'),
+    )
+    expect(adminPageHtml.split('注册模式读取失败').length - 1).toBe(1)
+    expect(adminPageHtml.split('正在读取注册模式…').length - 1).toBe(2)
+
+    // resetData() (logout / 401) lands on the neutral state, so a re-login
+    // never starts out claiming a failure.
+    const resetData = section('function resetData', 'function endSession')
+    expect(resetData).toContain("state.modeStatus = 'idle'")
+    expect(resetData).not.toContain("'error'")
+
+    // loadMode() announces the read before awaiting it, and only the catch
+    // branch may mark the read as failed.
+    const loadMode = section(
+      'async function loadMode',
+      'async function refreshAll',
+    )
+    expect(loadMode).toContain("state.modeStatus = 'loading'")
+    expect(loadMode).toContain("state.modeStatus = 'ready'")
+    expect(loadMode).toContain("state.modeStatus = 'error'")
+    expect(loadMode.indexOf("state.modeStatus = 'loading'")).toBeLessThan(
+      loadMode.indexOf("state.modeStatus = 'ready'"),
+    )
+    expect(loadMode.indexOf("state.modeStatus = 'ready'")).toBeLessThan(
+      loadMode.indexOf("state.modeStatus = 'error'"),
+    )
+    expect(loadMode.indexOf('state.modeStatus =')).toBeLessThan(
+      loadMode.indexOf('await api('),
+    )
+
+    // A state change is not a repaint: the loading hint has to be painted
+    // before the request is awaited, otherwise the user keeps looking at the
+    // previous copy (or the static first paint) for the whole read. Pinning
+    // the assignment alone would stay green if that renderMode() call were
+    // deleted, so the call itself is pinned between the two.
+    const paintAt = loadMode.indexOf('renderMode()')
+    expect(paintAt).toBeGreaterThan(
+      loadMode.indexOf("state.modeStatus = 'loading'"),
+    )
+    expect(paintAt).toBeLessThan(loadMode.indexOf('await api('))
+    // Both paints survive: one for the in-flight state, one for the settled
+    // state (ready or error) after the await.
+    expect(loadMode.match(/renderMode\(\)/g)).toHaveLength(2)
+
+    // The static first paint is honest as well: the radios start disabled and
+    // the hint starts neutral, before any script has run.
+    expect(adminPageHtml).toContain('id="mode-hint">正在读取注册模式…<')
+    const modeInputs = adminPageHtml.match(
+      /<input type="radio" name="registrationMode"[^>]*>/g,
+    )
+    expect(modeInputs).toHaveLength(3)
+    for (const input of modeInputs ?? []) {
+      expect(input).toContain('disabled')
+    }
+  })
+
+  it('settles the registration mode when the panel load fails before the read', () => {
+    // enterPanel() reads the user list first and returns early when it fails,
+    // so /api/registration-info is never sent at all. Left on the neutral copy
+    // the settings hint waits forever for a request that will not happen, so
+    // the panel-level failure has to settle the mode region on its own.
+    const enterPanel = section(
+      'async function enterPanel',
+      'function bindEvents',
+    )
+    const usersCatch = enterPanel.slice(
+      enterPanel.indexOf('await loadUsers(epoch)'),
+      enterPanel.indexOf('if (epoch !== sessionEpoch) return'),
+    )
+    // Comments talk about loadMode()/the request, so only the executable lines
+    // are checked: a comment must not satisfy (or fail) any assertion here.
+    // Block comments are stripped too — and the behavioural test below settles
+    // the string-literal case by running the real function.
+    const usersCatchCode = usersCatch
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '')
+    // Deleting either line (or moving them out of this catch) leaves the hint
+    // on "正在读取注册模式…" and turns this red.
+    expect(usersCatchCode).toContain("state.modeStatus = 'error'")
+    expect(usersCatchCode).toContain('renderMode()')
+    // A state change is not a repaint: the hint has to be painted before the
+    // early return, otherwise the user keeps the loading copy.
+    expect(usersCatchCode.indexOf("state.modeStatus = 'error'")).toBeLessThan(
+      usersCatchCode.indexOf('renderMode()'),
+    )
+    expect(usersCatchCode.indexOf('renderMode()')).toBeLessThan(
+      usersCatchCode.indexOf('notice('),
+    )
+    // ...and only while the mode state is still untouched (a 刷新 click during
+    // this same request starts loadMode() concurrently, and its result must
+    // not be overwritten here) — pinned behaviourally below, so either guard
+    // form passes. Settled locally: no second /api/registration-info, no
+    // request at all.
+    expect(usersCatchCode).not.toContain('loadMode(')
+    expect(usersCatchCode).not.toContain('api(')
+
+    // The state it lands on is the one that renders the failure copy: the
+    // failure branch is checked before the neutral fallback, so 'error' can
+    // never paint "正在读取".
+    const renderMode = section('function renderMode', '// --- Home dashboard')
+    expect(renderMode).toContain("state.modeStatus === 'error'")
+    expect(renderMode.indexOf("state.modeStatus === 'error'")).toBeLessThan(
+      renderMode.indexOf('注册模式读取失败，请刷新页面重试。'),
+    )
+    expect(
+      renderMode.indexOf('注册模式读取失败，请刷新页面重试。'),
+    ).toBeLessThan(renderMode.indexOf('正在读取注册模式…'))
+    // Every branch of the hint is a fixed literal, so no state (this one
+    // included) can paint `undefined` into the region.
+    expect(renderMode).toContain("'注册页地址：/register；切换后立即生效。'")
+    expect(renderMode).toContain("'注册模式读取失败，请刷新页面重试。'")
+    expect(renderMode).toContain("'正在读取注册模式…'")
+
+    // The radios stay disabled: this path never reaches 'ready'.
+    expect(renderMode).toContain("var ready = state.modeStatus === 'ready'")
+    expect(renderMode).toContain('radios[i].disabled = !ready')
+  })
+
+  // The page ships as one inline script, so a source-level assertion cannot see
+  // whether the failure branch overwrites a mode that a concurrent 刷新 already
+  // loaded. This runs the real enterPanel() body (extracted from the page) with
+  // the panel state and the collaborators it calls injected, so the assertions
+  // below are on what the function actually does to `state`.
+  const runEnterPanel = async (options: {
+    modeStatus: string
+    mode?: string
+    usersFail?: boolean
+  }) => {
+    const source = section('async function enterPanel', 'function bindEvents')
+    const state: { mode: string; modeStatus: string } = {
+      mode: options.mode ?? '',
+      modeStatus: options.modeStatus,
+    }
+    const calls: string[] = []
+    const sessionEpoch = 7
+    const build = new Function(
+      'state',
+      'sessionEpoch',
+      'showPanel',
+      'loadUsers',
+      'handleAuth',
+      'renderMode',
+      'notice',
+      'messageFor',
+      'loadOrphans',
+      'loadMode',
+      'loadBuildInfo',
+      `${source}\nreturn enterPanel`,
+    ) as (...args: any[]) => any
+    const enterPanel = build(
+      state,
+      sessionEpoch,
+      () => calls.push('showPanel'),
+      async (epoch: number) => {
+        calls.push(`loadUsers:${epoch}`)
+        if (options.usersFail) {
+          throw Object.assign(new Error('boom'), { status: 500 })
+        }
+      },
+      () => {
+        calls.push('handleAuth')
+        return false
+      },
+      () => calls.push('renderMode'),
+      (message: string) => calls.push(`notice:${message}`),
+      (err: { status: number }) => `HTTP ${err.status}`,
+      async () => calls.push('loadOrphans'),
+      async () => {
+        calls.push('loadMode')
+        // The real loader announces the read before awaiting it.
+        state.modeStatus = 'loading'
+      },
+      async () => calls.push('loadBuildInfo'),
+    ) as () => Promise<void>
+    await enterPanel()
+    return { state, calls }
+  }
+
+  it('collapses a panel-level failure only while the mode state is untouched', async () => {
+    // Nothing read the mode yet: the hint must settle on the failure copy
+    // instead of waiting for a request that was never sent.
+    const idle = await runEnterPanel({ modeStatus: 'idle', usersFail: true })
+    expect(idle.state.modeStatus).toBe('error')
+    expect(idle.calls).toContain('renderMode')
+    expect(idle.calls).toContain('notice:HTTP 500')
+    // Settled locally: the read itself was never dispatched.
+    expect(idle.calls).not.toContain('loadMode')
+    expect(idle.calls).not.toContain('loadOrphans')
+
+    // A 刷新 click during that same request already loaded the real mode. This
+    // later failure must not repaint it as a failure (contract 2 + 4).
+    const ready = await runEnterPanel({
+      modeStatus: 'ready',
+      mode: 'open',
+      usersFail: true,
+    })
+    expect(ready.state.modeStatus).toBe('ready')
+    expect(ready.state.mode).toBe('open')
+    expect(ready.calls).not.toContain('renderMode')
+
+    // A read still in flight owns the hint: the failure branch leaves it alone
+    // and loadMode() settles it afterwards.
+    const loading = await runEnterPanel({
+      modeStatus: 'loading',
+      usersFail: true,
+    })
+    expect(loading.state.modeStatus).toBe('loading')
+    expect(loading.calls).not.toContain('renderMode')
+
+    // A read that already failed keeps its own verdict.
+    const failed = await runEnterPanel({
+      modeStatus: 'error',
+      usersFail: true,
+    })
+    expect(failed.state.modeStatus).toBe('error')
+    expect(failed.calls).not.toContain('renderMode')
+
+    // The successful path is untouched: the mode read still starts.
+    const ok = await runEnterPanel({ modeStatus: 'idle' })
+    expect(ok.calls).toContain('loadMode')
+    expect(ok.state.modeStatus).toBe('loading')
+  })
+
+  // renderMode() is the only place that decides what the three radios show, so
+  // its checked/disabled pair is exercised against a fake DOM instead of being
+  // pinned by string matching: an assertion on the source line would stay green
+  // for any expression that still paints the stale mode as selected. The same
+  // painter is reused across states, because the bug is a transition — a read
+  // that succeeded and then failed leaves the previous value in state.mode.
+  const makeModePainter = () => {
+    const source = section('function renderMode', '// --- Home dashboard')
+    const radios = ['closed', 'approval', 'open'].map((value) => ({
+      value,
+      checked: false,
+      disabled: false,
+    }))
+    const hint = { textContent: '' }
+    const document = { querySelectorAll: () => radios }
+    const $ = (id: string) => {
+      expect(id).toBe('mode-hint')
+      return hint
+    }
+    const state: { mode: string; modeStatus: string } = {
+      mode: '',
+      modeStatus: 'idle',
+    }
+    const renderMode = new Function(
+      'state',
+      'document',
+      '$',
+      `${source}\nreturn renderMode`,
+    )(state, document, $) as () => void
+    return {
+      hint,
+      state,
+      // Omitted `mode` keeps the current value: a failed read does not rewrite
+      // state.mode, it only changes the status.
+      paint: (modeStatus: string, mode?: string) => {
+        state.modeStatus = modeStatus
+        if (mode !== undefined) state.mode = mode
+        renderMode()
+        return radios.map((radio) => ({
+          value: radio.value,
+          checked: radio.checked,
+          disabled: radio.disabled,
+        }))
+      },
+    }
+  }
+
+  it('never paints a stale registration mode as selected', () => {
+    const painter = makeModePainter()
+    const values = ['closed', 'approval', 'open']
+
+    // The reported bug: /api/registration-info failed after a successful read,
+    // so state.mode still says 'open'. Nothing may look selected while the
+    // mode is unknown — a checked radio is read as "this is the live mode".
+    painter.paint('ready', 'open')
+    const failed = painter.paint('error')
+    expect(painter.state.mode).toBe('open')
+    expect(failed.map((radio) => radio.checked)).toEqual([false, false, false])
+    expect(failed.map((radio) => radio.disabled)).toEqual([true, true, true])
+    expect(painter.hint.textContent).toBe('注册模式读取失败，请刷新页面重试。')
+
+    // Every not-ready status behaves the same: nothing selected, all disabled.
+    // 'idle' covers the logout / first-paint state, 'loading' the read in
+    // flight (and the repaint it triggers after a failed one).
+    for (const modeStatus of ['error', 'idle', 'loading']) {
+      const painted = painter.paint(modeStatus, 'open')
+      expect(
+        painted.map((radio) => radio.checked),
+        modeStatus,
+      ).toEqual([false, false, false])
+      expect(
+        painted.map((radio) => radio.disabled),
+        modeStatus,
+      ).toEqual([true, true, true])
+    }
+
+    // A settled 'ready' read is the only state that may select: the real mode
+    // is checked, every radio is editable, and switching stays enabled.
+    for (const mode of values) {
+      const ready = painter.paint('ready', mode)
+      expect(
+        ready.map((radio) => radio.checked),
+        mode,
+      ).toEqual(values.map((value) => value === mode))
+      expect(
+        ready.map((radio) => radio.disabled),
+        mode,
+      ).toEqual([false, false, false])
+      expect(painter.hint.textContent).toBe(
+        '注册页地址：/register；切换后立即生效。',
+      )
+    }
+
+    // ...and a failure after that ready paint drops the selection again
+    // instead of leaving the last known mode checked.
+    const relapsed = painter.paint('error')
+    expect(relapsed.map((radio) => radio.checked)).toEqual([
+      false,
+      false,
+      false,
+    ])
+    expect(painter.state.mode).toBe('open')
+  })
+
+  it('routes every session exit through endSession()', () => {
+    // 1. Logout button.
+    const logout = section(
+      "$('logout-btn').addEventListener",
+      "$('add-form').addEventListener",
+    )
+    expect(logout).toContain('endSession(')
+    expect(logout).not.toContain('showLogin(')
+    expect(logout).not.toContain('state.users = []')
+
+    // 2. Refresh button: any of the three loads may 401.
+    const refresh = section(
+      "$('refresh-btn').addEventListener",
+      "$('logout-btn').addEventListener",
+    )
+    expect(refresh).toContain('if (!handleAuth(err))')
+    expect(refresh).not.toContain('showLogin(')
+
+    // 3. Add-user form.
+    const addForm = section(
+      "$('add-form').addEventListener",
+      'var addPassword = $',
+    )
+    expect(addForm).toContain('if (handleAuth(err)) return')
+    expect(addForm).not.toContain('showLogin(')
+
+    // 4. Registration mode switch.
+    const modeSwitch = section(
+      "radios[i].addEventListener('change'",
+      'for (var t = 0; t < TAB_ORDER.length; t++)',
+    )
+    expect(modeSwitch).toContain('if (handleAuth(err)) return')
+    expect(modeSwitch).not.toContain('showLogin(')
+
+    // 5. Login form: a wrong password is not a session exit (there is no
+    // session yet), so it must NOT reset anything.
+    const loginForm = section(
+      "$('login-form').addEventListener",
+      "$('refresh-btn').addEventListener",
+    )
+    expect(loginForm).toContain(
+      "if (err.status === 401) errorNode.textContent = '密码错误'",
+    )
+    expect(loginForm).not.toContain('endSession(')
+
+    // 6. First load: 401 resets, any other failure shows the login view with
+    // the error (nothing to reset yet).
+    const init = section('async function init', 'bindEvents()\n  init()')
+    expect(init).toContain("if (err.status === 401) endSession('')")
+    expect(init).toContain('else showLogin(messageFor(err))')
+
+    // 7. Post-login load sequence: both stages route 401 through handleAuth.
+    const enterPanel = section(
+      'async function enterPanel',
+      'function bindEvents',
+    )
+    expect(enterPanel.match(/if \(handleAuth\(err\)\) return/g)).toHaveLength(2)
+    expect(enterPanel).not.toContain('showLogin(')
+
+    // 8. Row actions (approve / disable / enable) and their refresh.
+    const runAction = section(
+      'async function runAction',
+      'function summaryText',
+    )
+    expect(runAction).toContain('if (handleAuth(err)) return')
+    expect(runAction).not.toContain('showLogin(')
+
+    // 9. Modal submit: the single 401 branch that closes the dialog first.
+    const runModalSubmit = section(
+      'async function runModalSubmit',
+      'function openRejectModal',
+    )
+    expect(runModalSubmit).toContain("endSession('登录已过期，请重新登录')")
+    expect(runModalSubmit).not.toContain('showLogin(')
+
+    // 10. Every modal submit rethrows 401 into that branch instead of turning
+    // it into an inline field error.
+    const modals: Array<[string, string]> = [
+      ['openRejectModal', 'function openEditModal'],
+      ['openEditModal', 'function openResetModal'],
+      ['openResetModal', 'function openDeleteModal'],
+      ['openDeleteModal', 'function openRestoreModal'],
+      ['openRestoreModal', 'function openPurgeModal'],
+      ['openPurgeModal', 'function openDevicesModalFor'],
+      ['openDeleteDeviceModal', 'function bindTab'],
+    ]
+    for (const [name, end] of modals) {
+      const body = section(`function ${name}`, end)
+      expect(body, name).toContain('if (err.status === 401) throw err')
+      expect(body, name).not.toContain('showLogin(')
+    }
+
+    // 11. Device dialog loader (F6): close the dialog, then the shared exit.
+    const deviceList = section(
+      'async function loadDeviceList',
+      'function openDeleteDeviceModal',
+    )
+    expect(deviceList).toContain('closeModal()')
+    expect(deviceList).toContain('if (handleAuth(err)) return')
+    expect(deviceList).not.toContain('showLogin(')
+
+    // 12. Build-info loader (S3): an authenticated request, so a 401 is a
+    // session expiry, not a cosmetic failure.
+    const buildInfo = section(
+      'async function loadBuildInfo',
+      'function renderBuildInfo',
+    )
+    expect(buildInfo).toContain('if (handleAuth(err)) return')
+    expect(buildInfo).not.toContain('showLogin(')
+    expect(buildInfo).not.toContain(
+      'Session expiry is handled by the data loads',
+    )
+
+    // 13. The exit helpers themselves.
+    const handleAuth = section('function handleAuth', 'function resetData')
+    expect(handleAuth).toContain('if (err.status !== 401) return false')
+    expect(handleAuth).toContain('endSession(')
+
+    const endSession = section('function endSession', 'function showLogin')
+    expect(endSession).toContain('resetData()')
+  })
+
+  it('keeps showLogin() behind the single session-exit path', () => {
+    // The whole point of the audit: a new "session ended" path must call
+    // endSession()/resetData(), never showLogin() directly. Exactly three call
+    // sites are allowed — the definition, endSession() itself, and init()'s
+    // non-401 first-load branch (where no session exists to reset). A fourth
+    // one means a path bypassed the reset and would leak the old rows.
+    const callSites = adminPageHtml
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.includes('showLogin('))
+    expect(callSites.sort()).toEqual(
+      [
+        'function showLogin(message) {',
+        'showLogin(message)',
+        'else showLogin(messageFor(err))',
+      ].sort(),
+    )
+  })
+
+  it('drops responses that arrive after the session was reset', () => {
+    expect(adminPageHtml).toContain('var sessionEpoch = 0')
+    const resetData = section('function resetData', 'function endSession')
+    expect(resetData).toContain('sessionEpoch++')
+
+    // Every loader must carry the guard, so a loader added later cannot skip
+    // it without failing this list and the per-loader checks below.
+    const loaderStarts = [
+      ...adminPageHtml.matchAll(/async function (load\w+)/g),
+    ]
+    expect(loaderStarts.map((match) => match[1])).toEqual([
+      'loadUsers',
+      'loadOrphans',
+      'loadMode',
+      'loadBuildInfo',
+      'loadDeviceList',
+    ])
+    for (const match of loaderStarts) {
+      const from = match.index ?? 0
+      const rest = adminPageHtml.slice(from + 1)
+      const nextFunction = rest.search(/\n {2}(?:async )?function /)
+      const body = adminPageHtml.slice(from, from + 1 + nextFunction)
+      expect(body, match[1]).toContain('sessionEpoch')
+      expect(body, match[1]).toMatch(/epoch !== sessionEpoch/)
+    }
+
+    // The guard sits before the write, in the failure path as well as the
+    // success path: a late 200 must not land in state, a late 401 must not
+    // reset a session that has already been replaced.
+    const users = section(
+      'async function loadUsers',
+      'async function loadOrphans',
+    )
+    expect(users.match(/if \(epoch !== sessionEpoch\) return/g)).toHaveLength(2)
+    expect(users.indexOf('if (epoch !== sessionEpoch) return')).toBeLessThan(
+      users.indexOf('state.users = data.users'),
+    )
+
+    const orphans = section(
+      'async function loadOrphans',
+      'async function loadMode',
+    )
+    expect(orphans.match(/if \(epoch !== sessionEpoch\) return/g)).toHaveLength(
+      2,
+    )
+    expect(orphans.indexOf('if (epoch !== sessionEpoch) return')).toBeLessThan(
+      orphans.indexOf('state.orphans = data'),
+    )
+
+    const buildInfo = section(
+      'async function loadBuildInfo',
+      'function renderBuildInfo',
+    )
+    expect(
+      buildInfo.match(/if \(epoch !== sessionEpoch\) return/g),
+    ).toHaveLength(2)
+    expect(
+      buildInfo.indexOf('if (epoch !== sessionEpoch) return'),
+    ).toBeLessThan(buildInfo.indexOf('state.build ='))
+
+    const devices = section(
+      'async function loadDeviceList',
+      'function openDeleteDeviceModal',
+    )
+    expect(devices.match(/if \(epoch !== sessionEpoch\) return/g)).toHaveLength(
+      2,
+    )
+    expect(devices.indexOf('if (epoch !== sessionEpoch) return')).toBeLessThan(
+      devices.indexOf('container.appendChild(wrap)'),
+    )
+
+    // Composite flows pin the epoch they started in, so a logout between two
+    // awaits cannot let the rest of the chain repopulate the panel.
+    const refreshAll = section(
+      'async function refreshAll',
+      'function renderUsers',
+    )
+    expect(refreshAll).toContain('var epoch = sessionEpoch')
+    expect(refreshAll).toContain('loadUsers(epoch)')
+    expect(refreshAll).toContain('loadOrphans(epoch)')
+
+    const enterPanel = section(
+      'async function enterPanel',
+      'function bindEvents',
+    )
+    expect(enterPanel).toContain('var epoch = sessionEpoch')
+    expect(enterPanel).toContain('loadUsers(epoch)')
+    expect(enterPanel).toContain(
+      'loadOrphans(epoch), loadMode(epoch), loadBuildInfo(epoch)',
+    )
+    expect(
+      enterPanel.indexOf('if (epoch !== sessionEpoch) return'),
+    ).toBeLessThan(enterPanel.indexOf('Promise.all('))
+  })
+
+  it('drops both tables and the dashboard into an unavailable state on failure', () => {
+    expect(adminPageHtml).toContain('usersLoaded: false')
+    expect(adminPageHtml).toContain('orphansLoaded: false')
+    for (const id of [
+      'users-table-wrap',
+      'users-unavailable',
+      'orphans-table-wrap',
+      'orphans-unavailable',
+    ]) {
+      expect(adminPageHtml).toContain(`id="${id}"`)
+    }
+
+    // A failed load re-renders the table (not only the dashboard), so stale
+    // rows with live action buttons cannot survive a failed refresh.
+    const loadUsers = adminPageHtml.slice(
+      adminPageHtml.indexOf('async function loadUsers'),
+      adminPageHtml.indexOf('async function loadOrphans'),
+    )
+    expect(loadUsers).toContain('state.usersLoaded = false')
+    expect(loadUsers).toContain('state.usersLoaded = true')
+    expect(loadUsers).toContain('renderUsers()')
+    expect(loadUsers.indexOf('state.usersLoaded = false')).toBeLessThan(
+      loadUsers.indexOf('state.usersLoaded = true'),
+    )
+
+    const loadOrphans = adminPageHtml.slice(
+      adminPageHtml.indexOf('async function loadOrphans'),
+      adminPageHtml.indexOf('async function loadMode'),
+    )
+    expect(loadOrphans).toContain('state.orphansLoaded = false')
+    expect(loadOrphans).toContain('renderOrphans()')
+    expect(loadOrphans.indexOf('state.orphansLoaded = false')).toBeLessThan(
+      loadOrphans.indexOf('state.orphansLoaded = true'),
+    )
+
+    // Both renderers hide the table and show the unavailable note, and return
+    // before building any row/action buttons.
+    const renderOrphans = adminPageHtml.slice(
+      adminPageHtml.indexOf('function renderOrphans'),
+      adminPageHtml.indexOf('function renderMode'),
+    )
+    expect(renderOrphans).toContain("$('orphans-table-wrap').hidden = !loaded")
+    expect(renderOrphans).toContain("$('orphans-unavailable').hidden = loaded")
+    expect(renderOrphans.indexOf('if (!loaded)')).toBeLessThan(
+      renderOrphans.indexOf('恢复账号'),
+    )
+
+    const renderUsers = adminPageHtml.slice(
+      adminPageHtml.indexOf('function renderUsers'),
+      adminPageHtml.indexOf('function addUserActions'),
+    )
+    expect(renderUsers).toContain("$('users-table-wrap').hidden = !loaded")
+    expect(renderUsers).toContain("$('users-unavailable').hidden = loaded")
+    expect(renderUsers.indexOf('if (!loaded)')).toBeLessThan(
+      renderUsers.indexOf('addUserActions(group, user)'),
+    )
+
+    // Everything derived from the user list follows the same rule.
+    const renderHome = adminPageHtml.slice(
+      adminPageHtml.indexOf('function renderHome'),
+      adminPageHtml.indexOf('function renderTodo'),
+    )
+    expect(renderHome).toContain('var usersLoaded = state.usersLoaded')
+    expect(renderHome).toContain(
+      '$(' + "'kpi-users').textContent = usersLoaded",
+    )
+
+    const renderRecent = adminPageHtml.slice(
+      adminPageHtml.indexOf('function renderRecent'),
+      adminPageHtml.indexOf('function dayKey'),
+    )
+    expect(renderRecent).toContain('用户列表暂时无法获取')
+
+    const renderActivity = adminPageHtml.slice(
+      adminPageHtml.indexOf('function renderActivity'),
+      adminPageHtml.indexOf('function buildVersion'),
+    )
+    expect(renderActivity).toContain('bars.hidden = true')
+  })
+})
+
+describe('admin theme switch and brand assets', () => {
+  // Same slice helper as `page markup safety`, but local to this block: the
+  // existing describe is not touched, only appended to.
+  const between = (start: string, end: string): string => {
+    const from = adminPageHtml.indexOf(start)
+    expect(from, `missing start marker: ${start}`).toBeGreaterThan(-1)
+    const to = adminPageHtml.indexOf(end, from + start.length)
+    expect(to, `missing marker after ${start}: ${end}`).toBeGreaterThan(from)
+    return adminPageHtml.slice(from, to)
+  }
+
+  it('serves /favicon.ico as a session-less static ICO', async () => {
+    // Unconfigured deployment: the panel route 404s there, but its own
+    // <link rel="icon"> must still resolve — an ICO leaks nothing.
+    const res = await app.request('/favicon.ico', {}, makeEnv())
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toBe('image/x-icon')
+    expect(res.headers.get('cache-control')).toBe(
+      'public, max-age=604800, immutable',
+    )
+
+    const bytes = new Uint8Array(await res.arrayBuffer())
+    // ICONDIR: reserved 0, type 1 (icon), image count 2.
+    expect(Array.from(bytes.slice(0, 4))).toEqual([0x00, 0x00, 0x01, 0x00])
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    expect(view.getUint16(4, true)).toBe(2)
+
+    // Both directory entries are PNG payloads (the ICO may embed PNG
+    // directly): 16x16 first, then 32x32, "0" meaning 256.
+    const sizes: number[] = []
+    for (let index = 0; index < 2; index++) {
+      const entry = 6 + index * 16
+      const width = view.getUint8(entry)
+      sizes.push(width === 0 ? 256 : width)
+      expect(view.getUint8(entry + 1)).toBe(width === 0 ? 0 : width)
+      expect(view.getUint16(entry + 4, true)).toBe(1)
+      expect(view.getUint16(entry + 6, true)).toBe(32)
+      const length = view.getUint32(entry + 8, true)
+      const offset = view.getUint32(entry + 12, true)
+      expect(offset + length).toBeLessThanOrEqual(bytes.length)
+      expect(Array.from(bytes.slice(offset, offset + 8))).toEqual([
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+      ])
+    }
+    expect(sizes).toEqual([16, 32])
+    expect(bytes.length).toBeLessThanOrEqual(8 * 1024)
+
+    // The bytes are decoded once at module scope and reused: the route hands
+    // back the very same view, and a second request is byte-identical.
+    const { faviconIco } = await import('@/assets/favicon')
+    expect(Array.from(bytes)).toEqual(Array.from(faviconIco))
+    const again = await app.request('/favicon.ico', {}, makeEnv())
+    expect(new Uint8Array(await again.arrayBuffer())).toEqual(bytes)
+  })
+
+  it('links the favicon from both pages instead of the empty data: icon', () => {
+    for (const [name, html] of pages) {
+      expect(html, name).toContain(
+        '<link rel="icon" href="/favicon.ico" sizes="any">',
+      )
+      expect(html, name).not.toContain('href="data:,"')
+    }
+  })
+
+  it('inlines the brand logo to the left of the heading', () => {
+    const topbar = between('<header class="topbar">', '</header>')
+    // The brand svg only: the theme icons in the same topbar are counted in
+    // their own test, so this slice stops where the logo does.
+    const brand = between('<div class="brand">', '</div>')
+    expect(brand).toContain('viewBox="0 0 447.942 447.943"')
+    expect(brand).toContain('width="28" height="28"')
+    expect(brand).toContain('aria-hidden="true"')
+    expect(brand).toContain('focusable="false"')
+    // Both paths verbatim, with the source fills and no gradient.
+    expect(brand).toContain('fill="#5ed698"')
+    expect(brand).toContain('fill="#4daf7c"')
+    expect(brand.match(/<path /g)).toHaveLength(2)
+    expect(brand).not.toContain('gradient')
+    // Inside .brand, before the <h1>.
+    expect(topbar.indexOf('class="brand"')).toBeGreaterThan(-1)
+    expect(topbar.indexOf('viewBox=')).toBeGreaterThan(
+      topbar.indexOf('class="brand"'),
+    )
+    expect(topbar.indexOf('viewBox=')).toBeLessThan(topbar.indexOf('<h1>'))
+
+    expect(adminPageHtml).toContain(
+      '.brand { --brand-logo-size: 28px; display: flex; align-items: flex-start; gap: 10px; }',
+    )
+    expect(adminPageHtml).toContain('.brand svg { flex: none; }')
+    // Logo 的垂直中线对齐 h1 大标题的中线，而不是「标题+副标题」整块：
+    // .brand 顶端对齐 + h1 行盒与 logo 等高 → 两条中线重合，副标题排在 h1
+    // 之下、不参与 logo 定位。
+    expect(adminPageHtml).toContain(
+      '.brand h1 { line-height: var(--brand-logo-size); }',
+    )
+    expect(adminPageHtml).not.toContain(
+      '.brand { display: flex; align-items: center;',
+    )
+  })
+
+  it('puts a three-state theme switch in the session actions, left of 刷新', () => {
+    const actions = between(
+      'id="session-actions"',
+      '<button class="btn ghost" id="logout-btn"',
+    )
+    // 一个三段式图标按钮组，不再是文字下拉。
+    expect(actions).toContain(
+      '<div class="theme-switch" id="theme-switch" role="group" aria-label="主题">',
+    )
+    expect(adminPageHtml).not.toContain('theme-select')
+    expect(actions).not.toContain('<select')
+    expect(actions).not.toContain('<option')
+    for (const [mode, label] of [
+      ['light', '亮色'],
+      ['dark', '暗色'],
+      ['auto', '跟随系统'],
+    ] as const) {
+      // 每个状态一个按钮：模式、初始 aria-pressed=false、可读标签 + title。
+      expect(actions).toContain(
+        `data-theme-mode="${mode}" aria-pressed="false" aria-label="${label}" title="${label}"`,
+      )
+    }
+
+    // 图标全部内联且用 currentColor 着色：暗色主题下自动反色，不引外链、
+    // 不写死 fill，CSP 无需放宽。
+    const switchMarkup = between('<div class="theme-switch"', '</div>')
+    expect(switchMarkup.match(/<svg /g)).toHaveLength(3)
+    expect(switchMarkup.match(/width="16" height="16"/g)).toHaveLength(3)
+    for (const icon of switchMarkup.split('<svg ').slice(1)) {
+      expect(icon).toContain('fill="none"')
+      expect(icon).toContain('stroke="currentColor"')
+      expect(icon).toContain('aria-hidden="true"')
+      expect(icon).toContain('focusable="false"')
+      expect(icon).not.toMatch(/fill="#/)
+      expect(icon).not.toContain('http')
+    }
+    expect(switchMarkup).not.toContain('<img')
+    expect(switchMarkup).not.toContain('href=')
+    // 三个不同的字形：太阳（圆 + 光线）、月亮、显示器。
+    expect(switchMarkup).toContain('<circle cx="12" cy="12" r="4" />')
+    expect(switchMarkup).toContain('M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z')
+    expect(switchMarkup).toContain(
+      '<rect x="2" y="3" width="20" height="14" rx="2" />',
+    )
+
+    // 位置不变：#session-actions 内、刷新按钮左边。
+    expect(actions.indexOf('id="theme-switch"')).toBeLessThan(
+      actions.indexOf('id="refresh-btn"'),
+    )
+    // The control rides with #session-actions: it is hidden while logged out.
+    expect(actions).toContain('id="session-actions" hidden')
+
+    // 高亮态用主题变量（不写死颜色），亮/暗两套调色板各自提供它的底色。
+    expect(between(':root {', '[data-theme="dark"] {')).toContain(
+      '--lx-brand-soft:',
+    )
+    expect(between('[data-theme="dark"] {', '\n}')).toContain(
+      '--lx-brand-soft:',
+    )
+    const pressed = between('.theme-btn[aria-pressed="true"] {', '\n}')
+    expect(pressed).toContain('color: var(--lx-brand)')
+    expect(pressed).toContain('background: var(--lx-brand-soft)')
+    expect(pressed).toContain('border-color: var(--lx-brand)')
+    expect(pressed).not.toContain('#')
+    // 未选中态是灰字，两个主题下都从 --lx-muted 取色。
+    expect(between('.theme-btn {', '\n}')).toContain('color: var(--lx-muted)')
+    // 图标不被全局 svg 规则撑开。
+    expect(adminPageHtml).toContain('.theme-btn svg { display: block; }')
+  })
+
+  it('drives the palette from [data-theme] instead of the media query', () => {
+    // The system-preference override has to go: with it in place, an explicit
+    // "亮色" choice would still be overridden on a dark system.
+    expect(adminPageHtml).not.toContain('@media (prefers-color-scheme: dark)')
+    const light = between(':root {', '[data-theme="dark"] {')
+    expect(light).toContain('color-scheme: light;')
+    expect(light).toContain('--lx-bg: #f6f7f9;')
+    const dark = between('[data-theme="dark"] {', '\n}')
+    expect(dark).toContain('color-scheme: dark;')
+    expect(dark).toContain('--lx-bg: #0e1116;')
+    expect(dark).toContain('--lx-card: #1a1f26;')
+    expect(dark).toContain('--lx-text: #e6e9ee;')
+    // The new control is painted from variables like every other input.
+    expect(between('input, select {', 'input:focus')).toContain(
+      'background: var(--lx-card)',
+    )
+    // The pill is now a flush sunken capsule (rework should-fix 3): token
+    // paint, no hardcoded colour, and it must not grow taller than the
+    // buttons it sits beside.
+    expect(between('.theme-switch {', '\n}')).toContain(
+      'background: var(--lx-sunken)',
+    )
+    expect(between('.theme-switch {', '\n}')).toContain('padding: 0;')
+    expect(between('.theme-switch {', '\n}')).not.toContain('#')
+  })
+
+  it('resolves the first paint before the stylesheet loads', () => {
+    const head = between('<head>', '</head>')
+    expect(head).toContain('<link rel="icon" href="/favicon.ico" sizes="any">')
+    // Nothing recorded resolves to light, and the head cannot see the session
+    // at all (the cookie is HttpOnly), so it must never guess dark.
+    expect(head).toContain("var mode = 'light'")
+    expect(head).toContain("localStorage.getItem('lx-admin-theme')")
+    expect(head).toContain('matchMedia')
+    expect(head).toContain("root.setAttribute('data-theme', theme)")
+    expect(head).toContain("root.setAttribute('data-theme-mode', mode)")
+    expect(head).toContain('root.style.colorScheme = theme')
+    // A blocked storage (private mode) must not break the page.
+    expect(head).toContain('try {')
+    expect(head).toContain('} catch (err) {')
+    // The inline script is ahead of the stylesheet, not after it.
+    expect(head.indexOf('lx-admin-theme')).toBeLessThan(head.indexOf('<style>'))
+    expect(head.indexOf('<style>')).toBeGreaterThan(-1)
+  })
+
+  it('keeps the theme a session property: light when logged out, restored on login', () => {
+    const showLogin = between('function showLogin', 'function showPanel')
+    expect(showLogin).toContain("applyTheme('light')")
+    // …without discarding the stored choice, so the next login restores it.
+    expect(showLogin).not.toContain('removeItem')
+    expect(showLogin).not.toContain('storeThemeMode(')
+
+    const showPanel = between('function showPanel', 'async function loadUsers')
+    expect(showPanel).toContain("applyTheme(readThemeMode() || 'auto')")
+    expect(showPanel).toContain("$('session-actions').hidden = false")
+
+    // Logout and every 401 go through endSession(), which ends in showLogin().
+    const endSession = between('function endSession', 'function showLogin')
+    expect(endSession).toContain('resetData()')
+    expect(endSession).toContain('showLogin(message)')
+  })
+
+  it('persists the choice and repaints both modes from it', () => {
+    // The theme helpers are exercised against a fake document instead of being
+    // pinned by string matching: resolution, the <html> attributes and the
+    // storage guards are the behaviour, not the source line.
+    const source = between(
+      '// --- Theme (light / dark / auto)',
+      'function formatTime',
+    )
+    const build = (
+      options: { stored?: string; throws?: boolean; matches?: boolean } = {},
+    ) => {
+      const store = new Map<string, string>()
+      if (options.stored !== undefined)
+        store.set('lx-admin-theme', options.stored)
+      const storage = {
+        getItem: (key: string) => {
+          if (options.throws) throw new Error('denied')
+          return store.has(key) ? (store.get(key) as string) : null
+        },
+        setItem: (key: string, value: string) => {
+          if (options.throws) throw new Error('denied')
+          store.set(key, value)
+        },
+      }
+      const attributes: Record<string, string> = {}
+      const root = {
+        style: {} as { colorScheme?: string },
+        getAttribute: (name: string) => attributes[name] ?? null,
+        setAttribute: (name: string, value: string) => {
+          attributes[name] = value
+        },
+      }
+      // The panel paints the pressed state through exactly this selector, so
+      // the fake asserts the query instead of accepting any selector.
+      const buttons = ['light', 'dark', 'auto'].map((mode) => {
+        const button = {
+          mode,
+          pressed: '',
+          getAttribute(name: string) {
+            if (name === 'data-theme-mode') return mode
+            if (name === 'aria-pressed') return button.pressed || null
+            return null
+          },
+          setAttribute(name: string, value: string) {
+            if (name === 'aria-pressed') button.pressed = value
+          },
+        }
+        return button
+      })
+      const document = {
+        documentElement: root,
+        querySelectorAll: (selector: string) => {
+          expect(selector).toBe('#theme-switch [data-theme-mode]')
+          return buttons
+        },
+      }
+      const darkMedia = { matches: options.matches === true }
+      const api = new Function(
+        'document',
+        'localStorage',
+        '$',
+        'darkMediaValue',
+        'THEME_KEY',
+        `${source}
+  darkMedia = darkMediaValue
+  return {
+    readThemeMode: readThemeMode,
+    storeThemeMode: storeThemeMode,
+    systemTheme: systemTheme,
+    themeMode: themeMode,
+    applyTheme: applyTheme
+  }`,
+      )(document, storage, () => null, darkMedia, 'lx-admin-theme') as {
+        readThemeMode: () => string
+        storeThemeMode: (mode: string) => void
+        systemTheme: () => string
+        themeMode: () => string
+        applyTheme: (mode: string) => void
+      }
+      return { ...api, store, root, buttons }
+    }
+
+    // The highlight is read back from aria-pressed, exactly what assistive
+    // tech and the stylesheet see — never a private "active" flag.
+    const pressed = (list: { mode: string; pressed: string }[]) =>
+      list.filter((item) => item.pressed === 'true').map((item) => item.mode)
+
+    // Nothing recorded yet: the panel starts on 'auto' (contract 3), which the
+    // head script could only have resolved to light.
+    const fresh = build()
+    expect(fresh.readThemeMode()).toBe('')
+    expect(fresh.systemTheme()).toBe('light')
+    fresh.applyTheme(fresh.readThemeMode() || 'auto')
+    expect(fresh.root.getAttribute('data-theme')).toBe('light')
+    expect(fresh.root.getAttribute('data-theme-mode')).toBe('auto')
+    expect(pressed(fresh.buttons)).toEqual(['auto'])
+
+    // Explicit light stays light even on a dark system, and dark goes dark.
+    for (const [mode, expected] of [
+      ['light', 'light'],
+      ['dark', 'dark'],
+    ] as const) {
+      const panel = build({ matches: true })
+      panel.applyTheme(mode)
+      expect(panel.root.getAttribute('data-theme'), mode).toBe(expected)
+      expect(panel.root.getAttribute('data-theme-mode'), mode).toBe(mode)
+      expect(panel.root.style.colorScheme, mode).toBe(expected)
+      expect(pressed(panel.buttons), mode).toEqual([mode])
+    }
+
+    // 'auto' resolves both ways and only records itself as the mode.
+    const autoDark = build({ matches: true })
+    autoDark.applyTheme('auto')
+    expect(autoDark.root.getAttribute('data-theme')).toBe('dark')
+    expect(autoDark.root.getAttribute('data-theme-mode')).toBe('auto')
+    expect(pressed(autoDark.buttons)).toEqual(['auto'])
+
+    // The choice persists under the contract key, and is read back on reload.
+    const persisted = build()
+    persisted.applyTheme('dark')
+    persisted.storeThemeMode('dark')
+    expect(persisted.store.get('lx-admin-theme')).toBe('dark')
+    expect(build({ stored: 'dark' }).readThemeMode()).toBe('dark')
+    // An unknown stored value is ignored instead of being painted.
+    expect(build({ stored: 'sepia' }).readThemeMode()).toBe('')
+
+    // Blocked storage (private mode) must neither throw nor paint dark.
+    const blocked = build({ stored: 'dark', throws: true })
+    expect(blocked.readThemeMode()).toBe('')
+    expect(() => blocked.storeThemeMode('dark')).not.toThrow()
+    blocked.applyTheme(blocked.readThemeMode() || 'light')
+    expect(blocked.root.getAttribute('data-theme')).toBe('light')
+    expect(pressed(blocked.buttons)).toEqual(['light'])
+  })
+
+  it('follows the OS appearance live while, and only while, the choice is auto', () => {
+    const watcher = between(
+      "// 'auto' follows the OS appearance live",
+      "window.addEventListener('hashchange'",
+    )
+    expect(watcher).toContain(
+      "window.matchMedia('(prefers-color-scheme: dark)')",
+    )
+    expect(watcher).toContain("darkMedia.addEventListener('change'")
+    // The listener is a no-op unless the user's choice is still 'auto': a
+    // system flip must never override an explicit light/dark pick.
+    expect(watcher).toContain("if (themeMode() !== 'auto') return")
+    expect(watcher).toContain("applyTheme('auto')")
+
+    // The three buttons write the choice and repaint in the same tick, whether
+    // the hit landed on the button or on the icon inside it.
+    const click = between(
+      "var themeSwitch = $('theme-switch')",
+      "// 'auto' follows the OS appearance live",
+    )
+    expect(click).toContain("node.getAttribute('data-theme-mode')")
+    expect(click).toContain('node = node.parentNode')
+    expect(click).toContain('storeThemeMode(mode)')
+    expect(click).toContain('applyTheme(mode)')
+    // The mode is validated before it is stored or painted.
+    expect(click).toContain(
+      "if (mode !== 'light' && mode !== 'dark' && mode !== 'auto') mode = 'light'",
+    )
+    // No dead <select> wiring left behind.
+    expect(adminPageHtml).not.toContain("$('theme-select')")
+  })
+})
+
+describe('admin panel layout and about page polish (WK-22)', () => {
+  it('keeps every state on the shared interaction language', () => {
+    // Motion and micro-interaction rules are tokenized in the frozen palette,
+    // so the page CSS only references those values. The reduced-motion block
+    // then keeps the state changes while dropping the transition process.
+    expect(adminPageHtml).toContain('transition-duration: 0.01ms !important;')
+    expect(adminPageHtml).toContain('animation-duration: 0.01ms !important;')
+    expect(adminPageHtml).toContain('.btn[aria-busy="true"]::before')
+    expect(adminPageHtml).toContain('filter: saturate(0.4)')
+    expect(adminPageHtml).toContain('.btn.danger:hover:not(:disabled)')
+    const runAction = adminPageHtml.slice(
+      adminPageHtml.indexOf('async function runAction'),
+      adminPageHtml.indexOf('function summaryText'),
+    )
+    expect(runAction).toContain(
+      'if (buttons[i] === trigger) setBusy(buttons[i], true)',
+    )
+    expect(runAction).toContain('else buttons[i].disabled = true')
+    expect(runAction).not.toContain(
+      'buttons.length; i++) setBusy(buttons[i], true)',
+    )
+    expect(adminPageHtml).toContain(
+      "event.key !== 'Tab' || $('modal').hidden || modalState.busy",
+    )
+    expect(adminPageHtml).toContain(
+      "var dialog = document.querySelector('.modal-card')",
+    )
+  })
+
+  it('turns the admin result sets into labelled cards below 640px', () => {
+    // The responsive contract requires labels that survive the semantic table
+    // being stacked into cards. The same helper feeds user rows, orphan rows,
+    // recent registrations and the device dialog.
+    expect(adminPageHtml).toContain('function cell(label, className, text)')
+    expect(adminPageHtml).toContain("node.setAttribute('data-label', label)")
+    expect(adminPageHtml).toContain("var row = el('tr', 'user-row')")
+    expect(adminPageHtml).toContain("cell('用户名'")
+    expect(adminPageHtml).toContain("cell('操作'")
+    expect(adminPageHtml).toContain('@media (max-width: 640px)')
+    expect(adminPageHtml).toContain('content: attr(data-label)')
+  })
+
+  it('uses the "LX Music server 管理面板" wording for the page title and the about hero', () => {
+    expect(adminPageHtml).toContain('<h1>LX Music server 管理面板</h1>')
+    expect(adminPageHtml).not.toContain('<h1>LX Music 管理面板</h1>')
+    expect(adminPageHtml).toContain(
+      '<h2>LX Music server 管理面板</h2>\n        <p class="muted">LX Music 同步服务的管理后台</p>',
+    )
+    // 大标题、关于页 hero 与关于页「产品名称」行三处统一口径。
+    expect(adminPageHtml.split('LX Music server 管理面板')).toHaveLength(4)
+  })
+
+  it('uses the new subtitle under the admin page heading', () => {
+    expect(adminPageHtml).toContain(
+      '<p class="muted">一个兼容官方同步协议的重构版</p>',
+    )
+    expect(adminPageHtml).not.toContain('管理同步账号、注册模式与保留数据')
+    // 浏览器标题保持原样。
+    expect(adminPageHtml).toContain('<title>管理面板 · LX Music Server</title>')
+  })
+
+  it('gives the user table proportional column widths with the name column bounded', () => {
+    // 用户表专属样式块：从注释头到 .badge 规则之前。
+    const usersTableCss = adminPageHtml.slice(
+      adminPageHtml.indexOf('/* 用户表专属布局'),
+      adminPageHtml.indexOf('.badge {'),
+    )
+    expect(adminPageHtml).toContain('<table class="users-table">')
+    expect(usersTableCss).toContain(
+      '.users-table { table-layout: auto; width: 100%; }',
+    )
+    expect(usersTableCss).toContain(
+      '.users-table th, .users-table td { white-space: nowrap; }',
+    )
+    // 用户名不再宽 100%，改成有限比例 + 允许换行。
+    expect(usersTableCss).toContain(
+      '.users-table th:first-child, .users-table td:first-child { width: 18%; min-width: 160px; white-space: normal; }',
+    )
+    expect(usersTableCss).not.toContain('td:first-child { width: 100%; }')
+    // 操作列按钮组贴左，按钮仍保持单行（宽屏一行排开，窄屏靠横向滚动容器）。
+    expect(usersTableCss).toContain(
+      '.users-table .row-actions { justify-content: flex-start; flex-wrap: nowrap; }',
+    )
+    expect(usersTableCss).not.toContain('justify-content: flex-end')
+    // 8 列表头与内容均左对齐：用户表块内不再有右对齐规则。
+    expect(usersTableCss).not.toContain('text-align: right')
+    expect(usersTableCss).not.toContain('actions-col')
+    // 内边距按 4px 阶梯（space-2 / space-3）令牌化，横向滚动容器保留。
+    expect(adminPageHtml).toContain('th, td {')
+    expect(adminPageHtml).toContain(
+      'padding: var(--lx-space-2) var(--lx-space-3);',
+    )
+    expect(adminPageHtml).toContain('.table-wrap { overflow-x: auto; }')
+    expect(adminPageHtml).toContain(
+      '<div class="table-wrap" id="users-table-wrap">',
+    )
+    // 全局 .actions-col / .row-actions 保持原样，残留数据表布局不变。
+    expect(adminPageHtml).toContain('.actions-col { white-space: nowrap; }')
+    expect(adminPageHtml).toContain(
+      '.row-actions { display: flex; gap: var(--lx-space-2); flex-wrap: nowrap; }',
+    )
+  })
+
+  it('keeps the action buttons and their bindings untouched', () => {
+    for (const label of [
+      '批准',
+      '拒绝',
+      '禁用',
+      '启用',
+      '编辑配置',
+      '重置密码',
+      '设备',
+      '删除账号',
+    ]) {
+      expect(adminPageHtml).toContain(`'${label}'`)
+    }
+    expect(adminPageHtml).toContain(
+      "var actionCell = cell('操作', 'actions-col')",
+    )
+    expect(adminPageHtml).toContain("var group = el('div', 'row-actions')")
+    // Responsive cards need a label source for each row cell; the label is
+    // also what a screen reader gets in the mobile card layout.
+    expect(adminPageHtml).toContain("node.setAttribute('data-label', label)")
+    expect(adminPageHtml).toContain("var row = el('tr', 'user-row')")
+  })
+
+  it('drops the debug leftovers from the about page', () => {
+    expect(adminPageHtml).not.toContain('about-commit-short')
+    expect(adminPageHtml).not.toContain('about-hash')
+    expect(adminPageHtml).not.toContain('由部署流程注入')
+    // 构建信息卡五行与它们的 JS 赋值仍然完整。
+    for (const id of ['about-version', 'about-commit', 'about-built']) {
+      expect(adminPageHtml).toContain(`id="${id}"`)
+      expect(adminPageHtml).toContain(`$('${id}').textContent`)
+    }
+    // 源码仓库行是静态链接，不经过 JS 赋值。
+    expect(adminPageHtml).toContain('id="about-repo"')
+    expect(adminPageHtml).toContain('<dt>产品名称</dt>')
+    expect(adminPageHtml).toContain('<dt>版本号</dt>')
+    expect(adminPageHtml).toContain('<dt>构建哈希</dt>')
+    expect(adminPageHtml).toContain('<dt>构建时间</dt>')
+    expect(adminPageHtml).toContain('<dt>源码仓库</dt>')
+  })
+
+  it('credits the upstream project with safe external links', () => {
+    const aboutTab = adminPageHtml.slice(
+      adminPageHtml.indexOf('<div id="tab-panel-about"'),
+      adminPageHtml.indexOf('<div class="modal" id="modal"'),
+    )
+    expect(aboutTab).toContain('致谢')
+    expect(aboutTab).toContain(
+      '本项目是 原始项目 的重构版本，运行在 Cloudflare Worker 上，完全兼容原始项目的通信协议。',
+    )
+    // 「原始项目」在致谢正文里是纯文本，不再内嵌超链接；链接只保留在下方链接区。
+    expect(aboutTab).not.toContain('>原始项目</a>')
+    for (const repo of [
+      'lx-music-sync-server',
+      'lx-music-desktop',
+      'lx-music-mobile',
+    ]) {
+      const href = `href="https://github.com/lyswhut/${repo}" target="_blank" rel="noopener noreferrer"`
+      expect(aboutTab).toContain(href)
+    }
+    // 致谢卡排在构建信息卡之后，并复用 about-list 样式。
+    expect(aboutTab.indexOf('构建信息')).toBeLessThan(aboutTab.indexOf('致谢'))
+    const creditSection = aboutTab.slice(aboutTab.indexOf('致谢'))
+    expect(creditSection).toContain('<dl class="about-list">')
+    expect(creditSection).toContain('<div class="about-row">')
+  })
+
+  it('shows full https URLs on the about page links', () => {
+    const aboutTab = adminPageHtml.slice(
+      adminPageHtml.indexOf('<div id="tab-panel-about"'),
+      adminPageHtml.indexOf('<div class="modal" id="modal"'),
+    )
+    // 源码仓库行文案是完整 URL，链接属性不变。
+    expect(aboutTab).toContain(
+      '<a id="about-repo" href="https://github.com/WorkerHub/lx-music-server" target="_blank" rel="noopener noreferrer">https://github.com/WorkerHub/lx-music-server</a>',
+    )
+    expect(aboutTab).not.toContain('>WorkerHub/lx-music-server</a>')
+    // 「相关项目」标题只出现一次，两个仓库链接按 desktop / mobile 顺序放在同一个 dd 里。
+    expect(aboutTab.match(/<dt>相关项目<\/dt>/g)).toHaveLength(1)
+    const relatedRow = aboutTab.slice(
+      aboutTab.indexOf('<dt>相关项目</dt>'),
+      aboutTab.indexOf('</dl>', aboutTab.indexOf('<dt>相关项目</dt>')),
+    )
+    expect(relatedRow.match(/<dd>/g)).toHaveLength(1)
+    expect(relatedRow).toContain(
+      '<a href="https://github.com/lyswhut/lx-music-desktop" target="_blank" rel="noopener noreferrer">https://github.com/lyswhut/lx-music-desktop</a>',
+    )
+    expect(relatedRow).toContain(
+      '<a href="https://github.com/lyswhut/lx-music-mobile" target="_blank" rel="noopener noreferrer">https://github.com/lyswhut/lx-music-mobile</a>',
+    )
+    expect(relatedRow.indexOf('lx-music-desktop')).toBeLessThan(
+      relatedRow.indexOf('lx-music-mobile'),
+    )
+    for (const shortName of ['>lx-music-desktop</a>', '>lx-music-mobile</a>']) {
+      expect(relatedRow).not.toContain(shortName)
+    }
+  })
+})
+
+describe('responsive and motion contract', () => {
+  const styles = (html: string): string => {
+    const match = html.match(/<style>([\s\S]*?)<\/style>/)
+    expect(match).not.toBeNull()
+    return match![1]
+  }
+
+  it('keeps decorative layers out of hit testing on the SSR pages', () => {
+    for (const html of [homePageHtml('open', HOME_ORIGIN), registerPageHtml]) {
+      const css = styles(html)
+      const bodyBefore = css.slice(
+        css.indexOf('body::before'),
+        css.indexOf('.wrap'),
+      )
+      expect(bodyBefore).toContain('pointer-events: none;')
+    }
+  })
+
+  it('drops motion to instant states when the user asks for reduced motion', () => {
+    for (const [name, html] of pages) {
+      const css = styles(html)
+      expect(css, name).toContain('@media (prefers-reduced-motion: reduce)')
+      expect(css, name).toContain('animation-duration: 0.01ms !important;')
+      expect(css, name).toContain('transition-duration: 0.01ms !important;')
+    }
+  })
+
+  it('keeps every motion duration and easing on the shared tokens', () => {
+    for (const [name, html] of pages) {
+      const css = styles(html)
+      const reducedMotion = css.match(
+        /@media \(prefers-reduced-motion: reduce\) \{([\s\S]*)$/,
+      )
+      expect(reducedMotion, `${name} reduced-motion block`).not.toBeNull()
+      const normalCss = css.slice(0, reducedMotion!.index)
+      // Scan shorthand declarations on every page, not only transition: a raw
+      // animation duration must fail even when an old assertion forgot it.
+      for (const declaration of normalCss.matchAll(
+        /(?:transition|animation)(?!-duration):\s*([^;]+);/g,
+      )) {
+        expect(declaration[1], `${name}: ${declaration[0]}`).not.toMatch(
+          /\b\d+(?:\.\d+)?m?s\b/,
+        )
+      }
+      expect(css, name).toContain('var(--lx-motion-')
+      expect(css, name).toContain('var(--lx-ease-')
+    }
+    expect(baseTokensCss).toContain('--lx-motion-crisp: 80ms;')
+    expect(baseTokensCss).toContain('--lx-ease-emphasized:')
+    for (const palette of [baseTokensCss, darkTokensCss]) {
+      expect(palette).toContain('--lx-motion-crisp: 80ms;')
+      expect(palette).toContain('--lx-ease-emphasized:')
+      expect(palette).toContain('--lx-motion-spin: 720ms;')
+    }
+    expect(adminPageHtml).toContain(
+      'animation: lx-modal-in var(--lx-motion-slow) var(--lx-ease-emphasized) both;',
+    )
+    for (const html of [registerPageHtml, adminPageHtml]) {
+      expect(html).toContain(
+        'animation: lx-spin var(--lx-motion-spin) linear infinite;',
+      )
+    }
+  })
+
+  it('keeps entry motion on outer containers and reduced-motion consistent', () => {
+    // Animation-fill-mode on a button would pin transform: translateY(0) and
+    // suppress its :active scale, so entry motion belongs to the outer wrap.
+    for (const html of [homePageHtml('open', HOME_ORIGIN), registerPageHtml]) {
+      const css = styles(html)
+      const wrap = css.match(/\.wrap \{([^}]*)\}/)
+      expect(wrap).not.toBeNull()
+      expect(wrap![1]).toContain(
+        'animation: lx-fade-up var(--lx-motion-base) var(--lx-ease-out) both;',
+      )
+      expect(css.match(/@keyframes lx-fade-up/g)).toHaveLength(1)
+      expect(css).toContain('scroll-behavior: auto !important;')
+    }
+    const registerCss = styles(registerPageHtml)
+    expect(registerCss).not.toContain('.card, .field, .server-box, .btn')
+    expect(
+      homePageHtml('open', HOME_ORIGIN).match(
+        /@media \(hover: hover\) \{\n {2}\.card:hover/g,
+      ),
+    ).toHaveLength(1)
+  })
+
+  it('pins the three responsive ranges to the token source and page CSS', () => {
+    expect(BREAKPOINTS).toEqual({ sm: 640, md: 1024 })
+    for (const [name, html] of pages) {
+      expect(html, name).toContain('@media (max-width: 640px)')
+    }
+    expect(adminPageHtml).toContain('@media (max-width: 1024px)')
+    expect(adminPageHtml).toContain(
+      'grid-template-columns: repeat(2, minmax(0, 1fr));',
+    )
+  })
+})
+
+describe('admin panel live-feedback fixes (ONE-164)', () => {
+  it('renders all four KPI values through one formatting exit (item 2)', async () => {
+    // Pama measured 用户总数 as bigger than the other three. The static markup
+    // is uniform, so the only thing that can diverge is the value path: every
+    // count now leaves renderHome through kpiNumber, and a live session proves
+    // the four values are the same shape (plain decimal digits) whatever the
+    // data.
+    expect(adminPageHtml).toContain('function kpiNumber(value)')
+    const renderHome = adminPageHtml.slice(
+      adminPageHtml.indexOf('function renderHome'),
+      adminPageHtml.indexOf('function renderTodo'),
+    )
+    for (const id of [
+      'kpi-users',
+      'kpi-devices',
+      'kpi-pending',
+      'kpi-orphans',
+    ]) {
+      expect(renderHome).toContain(`$('${id}').textContent`)
+    }
+    // Every KPI value — loaded or unknown — goes through one exit. Multi-line
+    // statements are folded so the check sees whole assignments.
+    const kpiLines = renderHome
+      .replace(/\s*\n\s*/g, ' ')
+      .split(/(?=\$\('kpi-)/)
+      .filter((part) => part.includes("$('kpi-"))
+      .join('\n')
+    for (const fragment of [
+      'kpiNumber(state.users.length)',
+      'kpiNumber(deviceTotal())',
+      'kpiNumber(pending)',
+      'kpiNumber(state.orphans.length)',
+    ]) {
+      expect(kpiLines).toContain(fragment)
+    }
+    expect(kpiLines).not.toMatch(/String\(/)
+
+    // Live evidence: a real session, three users (one pending), and the four
+    // values the page would print. All digits, one shape.
+    const password = 'live-kpi-evidence'
+    const hash = await sha256Hex(password)
+    const { env, cookie } = await loginAdmin(password, hash)
+    await createUser(env, cookie, 'ann-live')
+    await createUser(env, cookie, 'bob-live', { maxSnapshotNum: 5 })
+    await createUser(env, cookie, 'cy-live')
+    const values = await kpiValues(env, cookie)
+    expect(values).toEqual({
+      'kpi-users': '3',
+      'kpi-devices': '0',
+      'kpi-pending': '0',
+      'kpi-orphans': '0',
+    })
+    for (const value of Object.values(values)) {
+      expect(value).toMatch(/^\d+$/)
+    }
+  })
+
+  it('gives every control the shared control-height token (items 1, 4, 5, 6)', () => {
+    // Same slice helper as `page markup safety`, local to this block.
+    const between = (start: string, end: string): string => {
+      const from = adminPageHtml.indexOf(start)
+      expect(from, `missing start marker: ${start}`).toBeGreaterThan(-1)
+      const to = adminPageHtml.indexOf(end, from + start.length)
+      expect(to, `missing marker after ${start}: ${end}`).toBeGreaterThan(from)
+      return adminPageHtml.slice(from, to)
+    }
+    // 输入框 / 按钮 / 主题按钮走同一个控件高度 token；间距 token 不再被
+    // 当控件高度用，裸尺寸不再散落在页面里。
+    // The token declarations live only in tokens.ts; check the imported CSS.
+    expect(baseTokensCss).toContain('--lx-control-height: 36px;')
+    expect(baseTokensCss).toContain('--lx-control-tap: 48px;')
+    const inputRule = between('input, select {', 'input:focus')
+    expect(inputRule).toContain('min-height: var(--lx-control-height);')
+    expect(inputRule).not.toContain('--lx-space-8')
+    const btnRule = between('.btn {', 'btn:hover')
+    expect(btnRule).toContain('min-height: var(--lx-control-height);')
+    const themeRule = between('.theme-btn {', '.theme-btn:hover')
+    expect(themeRule).toContain('width: var(--lx-control-height);')
+    expect(themeRule).toContain('height: var(--lx-control-height);')
+    // 表单提交按钮与普通按钮同高（项 5），不再被撑到输入框旧高度。
+    expect(adminPageHtml).not.toContain(
+      '.form-actions .btn { min-height: var(--lx-space-8); }',
+    )
+    // 移动端触控高度（48px）继续走 token，不是裸值。
+    for (const tap of [
+      '.tab { min-height: var(--lx-control-tap); }',
+      '.modal-actions .btn { width: 100%; min-height: var(--lx-control-tap); }',
+    ]) {
+      expect(adminPageHtml).toContain(tap)
+    }
+    // The 40×40 hardcode and the 64px input are gone from the page.
+    expect(adminPageHtml).not.toContain('width: 40px; height: 40px;')
+    expect(adminPageHtml).not.toMatch(/input, select \{[^}]*--lx-space-8/)
+  })
+
+  it('labels every chart column with its date on hover, focus and tap (item 3)', () => {
+    // 纯 CSS tooltip：data-label + ::after，键盘 focus / 触屏点按都可见，
+    // 不新增脚本、不动 CSP。
+    expect(adminPageHtml).toContain('.chart-col::after {')
+    expect(adminPageHtml).toContain('content: attr(data-label);')
+    expect(adminPageHtml).toContain(
+      '.chart-col:hover::after, .chart-col:focus-visible::after',
+    )
+    const renderActivity = adminPageHtml.slice(
+      adminPageHtml.indexOf('function renderActivity'),
+      adminPageHtml.indexOf('function buildVersion'),
+    )
+    expect(renderActivity).toContain("column.setAttribute('data-label', label)")
+    expect(renderActivity).toContain("column.setAttribute('aria-label', label)")
+    expect(renderActivity).toContain(
+      "entry.key + ' · ' + kpiNumber(entry.count) + ' 人'",
+    )
+    // 键盘可达：柱条可聚焦（roving tabindex + 方向键），focus 同样弹提示。
+    const ensure = adminPageHtml.slice(
+      adminPageHtml.indexOf('function ensureChartColumns'),
+      adminPageHtml.indexOf('function renderActivity'),
+    )
+    expect(ensure).toContain('column.tabIndex = i === 0 ? 0 : -1')
+    expect(ensure).toContain("key !== 'ArrowLeft' && key !== 'ArrowRight'")
+    expect(ensure).toContain("column.setAttribute('role', 'img')")
+    // 稳定节点：刷新只改 data-label / 高度，不清空重建，焦点与提示不丢。
+    expect(renderActivity).not.toContain('clear(bars)')
+    expect(renderActivity).toContain('bars.children[i]')
+  })
+
+  it('keeps formatted output out of every logic comparison (rework family 1)', () => {
+    // 格式化出口只渲染展示，严禁参与数值/相等比较（评审打回 #2 的根因族）：
+    // kpiNumber() 返回字符串，与数字比较是死码（'0' === 0 恒 false）。
+    expect(adminPageHtml).toContain('function kpiNumber(value)')
+    expect(adminPageHtml).not.toMatch(
+      /kpiNumber\([^)]*\)\s*(===|==|!==|!=|>|<|>=|<=)/,
+    )
+    // 其余格式化工具同样不得参与比较。
+    for (const fn of [
+      'formatTime',
+      'summaryText',
+      'versionText',
+      'labelFrom',
+      'statusClass',
+    ]) {
+      expect(adminPageHtml).not.toMatch(
+        new RegExp(`${fn}\\([^)]*\\)\\s*(===|==|!==|!=)`),
+      )
+    }
+    // 计数逻辑比较一律用原始数值。
+    const renderActivity = adminPageHtml.slice(
+      adminPageHtml.indexOf('function renderActivity'),
+      adminPageHtml.indexOf('function buildVersion'),
+    )
+    expect(renderActivity).toContain('series.total === 0')
+  })
+
+  it('keeps the chart tooltip anchored to its column (rework blocking 1)', () => {
+    // Same slice helper as `page markup safety`, local to this block.
+    const between = (start: string, end: string): string => {
+      const from = adminPageHtml.indexOf(start)
+      expect(from, `missing start marker: ${start}`).toBeGreaterThan(-1)
+      const to = adminPageHtml.indexOf(end, from + start.length)
+      expect(to, `missing marker after ${start}: ${end}`).toBeGreaterThan(from)
+      return adminPageHtml.slice(from, to)
+    }
+    // 绝对定位浮层必须有显式定位祖先，否则包含块退化到根视口（评审打回 #1）。
+    const chartCol = between('.chart-col {', '.chart-col:hover')
+    expect(chartCol).toContain('position: relative;')
+    const tooltip = between('.chart-col::after {', '.chart-col:hover::after')
+    expect(tooltip).toContain('position: absolute;')
+    // 定位规则实质断言：提示贴柱顶、横向居中于柱条。
+    expect(tooltip).toContain('bottom: calc(100% + var(--lx-space-1));')
+    expect(tooltip).toContain('left: 50%;')
+    expect(tooltip).toContain('transform: translateX(-50%);')
+    // 全页面扫描：每一个绝对/固定定位浮层都在一个显式定位的规则里（或自身）。
+    // 全套页面里的定位声明就这几处，逐一列明所属包含块。
+    const absCount = (adminPageHtml.match(/position: absolute;/g) ?? []).length
+    expect(absCount).toBe(3) // backdrop / tooltip / thead 视觉隐藏剪裁（非浮层）
+    expect(adminPageHtml).toContain('.modal { position: fixed; inset: 0;')
+    // backdrop 的包含块是 .modal（fixed），tooltip 的包含块是 .chart-col（relative），
+    // 剪裁规则是 1px 视觉隐藏（自身 absolute 定位，无浮层语义）。
+    expect(between('.modal-backdrop {', '\n}')).toContain('position: absolute;')
+  })
+
+  it('keeps the theme pill flush with the topbar button rhythm (rework should-fix 3)', () => {
+    const between = (start: string, end: string): string => {
+      const from = adminPageHtml.indexOf(start)
+      expect(from, `missing start marker: ${start}`).toBeGreaterThan(-1)
+      const to = adminPageHtml.indexOf(end, from + start.length)
+      expect(to, `missing marker after ${start}: ${end}`).toBeGreaterThan(from)
+      return adminPageHtml.slice(from, to)
+    }
+    // 外层胶囊不再加 padding+边框把自己撑高：整体高度就是按钮高度。
+    const pill = between('.theme-switch {', '\n}')
+    expect(pill).toContain('padding: 0;')
+    expect(pill).toContain('border: none;')
+    expect(pill).not.toContain('padding: var(')
+    // 按钮与 .btn 同一控件高度 token，无裸尺寸。
+    const themeRule = between('.theme-btn {', '.theme-btn:hover')
+    expect(themeRule).toContain('width: var(--lx-control-height);')
+    expect(themeRule).toContain('height: var(--lx-control-height);')
+  })
+
+  it('ships no local debug hooks in the production script (rework should-fix 4)', () => {
+    expect(adminPageHtml).not.toContain('saveView')
+    expect(adminPageHtml).not.toContain('globalThis.Deno')
+    // 渲染路径不得强制同步布局读取（getBoundingClientRect / getComputedStyle）。
+    const renderActivity = adminPageHtml.slice(
+      adminPageHtml.indexOf('function renderActivity'),
+      adminPageHtml.indexOf('function buildVersion'),
+    )
+    expect(renderActivity).not.toContain('getBoundingClientRect')
+    expect(renderActivity).not.toContain('getComputedStyle')
+  })
+
+  it('keeps the empty-chart copy reachable and the title fallback (rework nits 5/6)', () => {
+    // 空态文案：判断用原始数值，字符串输出只拼展示（实质断言：条件与分支配对）。
+    const renderActivity = adminPageHtml.slice(
+      adminPageHtml.indexOf('function renderActivity'),
+      adminPageHtml.indexOf('function buildVersion'),
+    )
+    const totalBlock = renderActivity.slice(
+      renderActivity.indexOf("$('chart-total').textContent"),
+    )
+    expect(totalBlock).toContain('series.total === 0')
+    expect(totalBlock).toContain("'近 30 天暂无新增'")
+    expect(totalBlock).toContain("'近 30 天新增 '")
+    // 触屏兜底：原生 title 与 ::after 提示并存。
+    expect(renderActivity).toContain('column.title = label')
+    expect(adminPageHtml).toContain('.chart-col::after {')
+  })
+})
