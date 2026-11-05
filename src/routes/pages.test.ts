@@ -2129,7 +2129,7 @@ describe('admin panel layout and about page polish (WK-22)', () => {
     expect(adminPageHtml).toContain('<title>管理面板 · LX Music Server</title>')
   })
 
-  it('gives the user table proportional column widths with the name column bounded', () => {
+  it('narrows the user table name column so desktop needs no horizontal drag', () => {
     // 用户表专属样式块：从注释头到 .badge 规则之前。
     const usersTableCss = adminPageHtml.slice(
       adminPageHtml.indexOf('/* 用户表专属布局'),
@@ -2139,17 +2139,26 @@ describe('admin panel layout and about page polish (WK-22)', () => {
     expect(usersTableCss).toContain(
       '.users-table { table-layout: auto; width: 100%; }',
     )
+    // 列距比通用表格紧一档（水平 8px），把宽度留给内容而不是横向滚动。
     expect(usersTableCss).toContain(
-      '.users-table th, .users-table td { white-space: nowrap; }',
+      '.users-table th, .users-table td {\n  white-space: nowrap;\n  padding-left: var(--lx-space-2);\n  padding-right: var(--lx-space-2);\n}',
     )
-    // 用户名不再宽 100%，改成有限比例 + 允许换行。
+    // 用户名按内容宽度取列宽：10ch 定宽 + 数据列允许换行，长名字折行而不是撑宽表格。
     expect(usersTableCss).toContain(
-      '.users-table th:first-child, .users-table td:first-child { width: 18%; min-width: 160px; white-space: normal; }',
+      '.users-table th:first-child, .users-table td:first-child { width: 10ch; min-width: 0; }',
     )
+    expect(usersTableCss).toContain(
+      '.users-table td:first-child { white-space: normal; }',
+    )
+    expect(usersTableCss).not.toContain('width: 18%')
+    expect(usersTableCss).not.toContain('min-width: 160px')
     expect(usersTableCss).not.toContain('td:first-child { width: 100%; }')
-    // 操作列按钮组贴左，按钮仍保持单行（宽屏一行排开，窄屏靠横向滚动容器）。
+    // 操作列按钮组贴左，平板保持单行（横滚兜底）；桌面宽度才允许折行。
     expect(usersTableCss).toContain(
       '.users-table .row-actions { justify-content: flex-start; flex-wrap: nowrap; }',
+    )
+    expect(usersTableCss).toContain(
+      '@media (min-width: 1024px) {\n  .users-table .row-actions { flex-wrap: wrap; }\n}',
     )
     expect(usersTableCss).not.toContain('justify-content: flex-end')
     // 8 列表头与内容均左对齐：用户表块内不再有右对齐规则。
@@ -2546,6 +2555,25 @@ describe('admin panel live-feedback fixes (ONE-164)', () => {
     // backdrop 的包含块是 .modal（fixed），tooltip 的包含块是 .chart-col（relative），
     // 剪裁规则是 1px 视觉隐藏（自身 absolute 定位，无浮层语义）。
     expect(between('.modal-backdrop {', '\n}')).toContain('position: absolute;')
+  })
+
+  it('keeps the modal backdrop see-through instead of a solid sheet', () => {
+    const between = (start: string, end: string): string => {
+      const from = adminPageHtml.indexOf(start)
+      expect(from, `missing start marker: ${start}`).toBeGreaterThan(-1)
+      const to = adminPageHtml.indexOf(end, from + start.length)
+      expect(to, `missing marker after ${start}: ${end}`).toBeGreaterThan(from)
+      return adminPageHtml.slice(from, to)
+    }
+    const backdrop = between('.modal-backdrop {', '\n}')
+    // 不透明度必须写在底色里。入场动画 `lx-fade` 的终帧是 opacity: 1，配
+    // fill-mode both 会常驻生效：写在 element opacity 上的值会被终帧覆盖，
+    // 遮罩退化成纯色（暗色主题下实测整屏等于 --lx-backdrop 本身，近全黑）。
+    expect(backdrop).toContain(
+      'background: color-mix(in srgb, var(--lx-backdrop) 40%, transparent);',
+    )
+    expect(backdrop).not.toContain('opacity:')
+    expect(backdrop).toContain('animation: lx-fade')
   })
 
   it('keeps the theme pill flush with the topbar button rhythm (rework should-fix 3)', () => {
